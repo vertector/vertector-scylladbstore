@@ -64,3 +64,8 @@ Thumbs.db
 .coverage
 coverage.xml
 htmlcov/
+
+# Vector indexes
+vector_index/
+test_vector_index/
+*_vector_index/
