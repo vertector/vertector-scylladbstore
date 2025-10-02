@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  scylla:
+    image: scylladb/scylla:2025.3
+    container_name: scylladb
+    ports:
+      - "9042:9042"  # CQL native transport port
+      - "9160:9160"  # Thrift client API
+      - "17000:7000"  # Inter-node communication
+      - "17001:7001"  # TLS inter-node communication
+      - "19000:10000"  # REST API
+    volumes:
+      - scylla_data:/var/lib/scylla
+    command: --smp 1 --memory 1G --overprovisioned 1
+    healthcheck:
+      test: ["CMD", "cqlsh", "-e", "describe cluster"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - scylla_network
+
+volumes:
+  scylla_data:
+    driver: local
+
+networks:
+  scylla_network:
+    driver: bridge
