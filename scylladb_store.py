@@ -15,11 +15,13 @@ from datetime import datetime, timezone
 from typing import (
     Any,
     AsyncIterator,
+    Awaitable,
     Callable,
     Iterable,
     Literal,
     Sequence,
     TypedDict,
+    Union,
 )
 
 from cassandra.cluster import Cluster, Session, ExecutionProfile, EXEC_PROFILE_DEFAULT, NoHostAvailable
@@ -382,9 +384,51 @@ class TTLConfig(TypedDict, total=False):
 
 
 class ScyllaIndexConfig(TypedDict, total=False):
-    """Configuration for secondary indexes and vector search."""
+    """Configuration for secondary indexes (SAI)."""
     enable_sai: bool  # Enable Storage-Attached Indexes
     indexed_fields: list[str]  # Fields to create secondary indexes on
+
+
+# Import LangChain Embeddings base class for type hints
+try:
+    from langchain_core.embeddings import Embeddings
+except ImportError:
+    Embeddings = None
+
+
+class IndexConfig(TypedDict):
+    """
+    Configuration for semantic search with vector embeddings.
+
+    Compatible with LangGraph's BaseStore IndexConfig.
+
+    Fields:
+        dims: Number of dimensions in embedding vectors (required)
+        embed: Embedding function or provider (required)
+        fields: Fields to extract for embedding (optional, defaults to ["$"])
+
+    Example:
+        >>> from langchain_google_genai import GoogleGenerativeAIEmbeddings
+        >>>
+        >>> embeddings = GoogleGenerativeAIEmbeddings(
+        ...     model="models/gemini-embedding-001",
+        ...     task_type="RETRIEVAL_DOCUMENT"
+        ... )
+        >>>
+        >>> index_config: IndexConfig = {
+        ...     "dims": 768,
+        ...     "embed": embeddings,
+        ...     "fields": ["text", "summary"]
+        ... }
+    """
+    dims: int  # Required: embedding dimensions
+    embed: Union[
+        Any,  # Embeddings instance (use Any to avoid import requirement)
+        Callable[[str], list[float]],                  # Sync embedding function
+        Callable[[str], Awaitable[list[float]]],       # Async embedding function
+        str                                             # Provider string (e.g., "openai:text-embedding-3-small")
+    ]  # Required: embedding function or provider
+    fields: list[str]  # Optional: fields to embed (defaults to ["$"])
 
 
 class ExecutionProfileConfig(TypedDict, total=False):
@@ -748,9 +792,12 @@ class AsyncScyllaDBStore(BaseStore):
         keyspace: str,
         *,
         deserializer: Callable[[str], dict[str, Any]] | None = None,
-        index: ScyllaIndexConfig | None = None,
+        index: IndexConfig | None = None,
+        sai_index: ScyllaIndexConfig | None = None,
         ttl: TTLConfig | None = None,
         execution_profiles: dict[str, ExecutionProfileConfig] | None = None,
+        enable_circuit_breaker: bool = True,
+        circuit_breaker_config: dict[str, Any] | None = None,
     ) -> None:
         """
         Initialize ScyllaDB store.
@@ -759,14 +806,18 @@ class AsyncScyllaDBStore(BaseStore):
             session: ScyllaDB/Cassandra session
             keyspace: Keyspace name
             deserializer: Optional JSON deserializer
-            index: Optional index configuration
+            index: Optional semantic search configuration (IndexConfig)
+            sai_index: Optional SAI secondary index configuration
             ttl: Optional TTL configuration
             execution_profiles: Optional execution profile configurations
+            enable_circuit_breaker: Enable circuit breaker for resilience (default: True)
+            circuit_breaker_config: Circuit breaker configuration (failure_threshold, success_threshold, timeout_seconds)
         """
         self.session = session
         self.keyspace = keyspace
         self.deserializer = deserializer or json.loads
-        self.index_config = index or {}
+        self.index_config = self._process_index_config(index) if index else None
+        self.sai_config = sai_index or {}
         self.ttl_config = ttl or {}
         self.execution_profiles = execution_profiles or {}
         self.lock = asyncio.Lock()
@@ -779,8 +830,177 @@ class AsyncScyllaDBStore(BaseStore):
         # Metrics tracking
         self.metrics = QueryMetrics()
 
-        # Circuit breaker for resilience (optional, disabled by default)
-        self.circuit_breaker: CircuitBreaker | None = None
+        # Circuit breaker for resilience (enabled by default)
+        if enable_circuit_breaker:
+            cb_config = circuit_breaker_config or {}
+            self.circuit_breaker = CircuitBreaker(
+                failure_threshold=cb_config.get("failure_threshold", 5),
+                success_threshold=cb_config.get("success_threshold", 2),
+                timeout_seconds=cb_config.get("timeout_seconds", 60.0)
+            )
+            logger.info(
+                f"Circuit breaker enabled with defaults: "
+                f"failure_threshold={self.circuit_breaker.failure_threshold}, "
+                f"timeout={self.circuit_breaker.timeout_seconds}s"
+            )
+        else:
+            self.circuit_breaker = None
+            logger.info("Circuit breaker disabled")
+
+    def _process_index_config(self, config: IndexConfig) -> IndexConfig:
+        """
+        Validate and process IndexConfig.
+
+        Args:
+            config: Raw IndexConfig from user
+
+        Returns:
+            Processed IndexConfig
+
+        Raises:
+            ValueError: If config is invalid
+        """
+        if "dims" not in config:
+            raise ValueError("IndexConfig must include 'dims' field")
+
+        if "embed" not in config:
+            raise ValueError("IndexConfig must include 'embed' field")
+
+        # Set default fields if not provided
+        if "fields" not in config:
+            config["fields"] = ["$"]  # Default to embedding entire object
+
+        # Validate dims
+        dims = config["dims"]
+        if not isinstance(dims, int) or dims <= 0:
+            raise ValueError(f"IndexConfig 'dims' must be a positive integer, got {dims}")
+
+        # Validate embed type
+        embed = config["embed"]
+        if isinstance(embed, str):
+            # Provider string - try to convert using init_embeddings
+            try:
+                from langchain.embeddings import init_embeddings
+                config["embed"] = init_embeddings(embed)
+                logger.info(f"Initialized embeddings from provider string: {embed}")
+            except ImportError:
+                raise ValueError(
+                    f"Cannot use provider string '{embed}' - langchain.embeddings not available. "
+                    "Install with: pip install langchain"
+                )
+            except Exception as e:
+                raise ValueError(f"Failed to initialize embeddings from provider '{embed}': {e}")
+        elif not callable(embed) and not hasattr(embed, 'embed_query'):
+            raise ValueError(
+                "IndexConfig 'embed' must be a callable, Embeddings instance, or provider string"
+            )
+
+        logger.info(
+            f"IndexConfig processed: dims={config['dims']}, "
+            f"fields={config['fields']}, "
+            f"embed_type={type(config['embed']).__name__}"
+        )
+
+        return config
+
+    def _extract_fields_for_embedding(
+        self,
+        value: dict[str, Any],
+        fields: list[str]
+    ) -> str:
+        """
+        Extract specified fields from value dict for embedding.
+
+        Supports JSON path syntax for nested fields.
+
+        Args:
+            value: Dictionary containing the data
+            fields: List of field names (["$"] for all fields)
+
+        Returns:
+            Concatenated string of field values
+        """
+        if fields == ["$"]:
+            # Embed entire object
+            return json.dumps(value, ensure_ascii=False)
+
+        # Extract specific fields
+        parts = []
+        for field in fields:
+            if "." in field:
+                # Support nested field access (e.g., "user.name")
+                keys = field.split(".")
+                val = value
+                for key in keys:
+                    if isinstance(val, dict) and key in val:
+                        val = val[key]
+                    else:
+                        val = None
+                        break
+                if val is not None:
+                    parts.append(str(val))
+            elif field in value:
+                parts.append(str(value[field]))
+
+        return " ".join(parts)
+
+    async def _generate_embedding(
+        self,
+        value: dict[str, Any],
+    ) -> list[float] | None:
+        """
+        Generate embedding for a value dict using IndexConfig.
+
+        Args:
+            value: Data to embed
+
+        Returns:
+            Embedding vector or None if embedding fails
+        """
+        if not self.index_config:
+            return None
+
+        # Extract fields
+        text = self._extract_fields_for_embedding(
+            value,
+            self.index_config.get("fields", ["$"])
+        )
+
+        if not text.strip():
+            logger.warning("Empty text for embedding, skipping")
+            return None
+
+        # Generate embedding
+        try:
+            embed = self.index_config["embed"]
+
+            # Handle different embedding types
+            if hasattr(embed, 'embed_query'):
+                # LangChain Embeddings instance
+                embedding = embed.embed_query(text)
+            elif asyncio.iscoroutinefunction(embed):
+                # Async function
+                embedding = await embed(text)
+            elif callable(embed):
+                # Sync function - run in executor
+                loop = asyncio.get_running_loop()
+                embedding = await loop.run_in_executor(None, embed, text)
+            else:
+                raise ValueError(f"Unsupported embedding type: {type(embed)}")
+
+            # Validate dimensions
+            expected_dims = self.index_config["dims"]
+            if len(embedding) != expected_dims:
+                raise ValueError(
+                    f"Embedding dimension mismatch: expected {expected_dims}, got {len(embedding)}"
+                )
+
+            return embedding
+
+        except Exception as e:
+            # Log error but don't fail the operation
+            logger.error(f"Failed to generate embedding: {e}", exc_info=e)
+            return None
 
     @classmethod
     @asynccontextmanager
@@ -790,9 +1010,12 @@ class AsyncScyllaDBStore(BaseStore):
         keyspace: str,
         *,
         pool_config: PoolConfig | None = None,
-        index: ScyllaIndexConfig | None = None,
+        index: IndexConfig | None = None,
+        sai_index: ScyllaIndexConfig | None = None,
         ttl: TTLConfig | None = None,
         execution_profiles: dict[str, ExecutionProfileConfig] | None = None,
+        enable_circuit_breaker: bool = True,
+        circuit_breaker_config: dict[str, Any] | None = None,
     ) -> AsyncIterator["AsyncScyllaDBStore"]:
         """
         Create AsyncScyllaDBStore from contact points.
@@ -857,21 +1080,13 @@ class AsyncScyllaDBStore(BaseStore):
         if "reconnection_policy" in pool_config:
             cluster_config["reconnection_policy"] = pool_config["reconnection_policy"]
 
+        # Connection pool settings - only set if explicitly provided in pool_config
+        # Note: These may not be supported in all driver versions
         if "core_connections_per_host" in pool_config:
             cluster_config["core_connections_per_host"] = pool_config["core_connections_per_host"]
-        else:
-            # Apply defaults
-            cluster_config["core_connections_per_host"] = {
-                "EXEC_PROFILE_DEFAULT": ConnectionPoolDefaults.CORE_CONNECTIONS_PER_HOST
-            }
 
         if "max_connections_per_host" in pool_config:
             cluster_config["max_connections_per_host"] = pool_config["max_connections_per_host"]
-        else:
-            # Apply defaults
-            cluster_config["max_connections_per_host"] = {
-                "EXEC_PROFILE_DEFAULT": ConnectionPoolDefaults.MAX_CONNECTIONS_PER_HOST
-            }
 
         # Create cluster with optimized configuration
         cluster = Cluster(**cluster_config)
@@ -902,8 +1117,11 @@ class AsyncScyllaDBStore(BaseStore):
                 session=session,
                 keyspace=keyspace,
                 index=index,
+                sai_index=sai_index,
                 ttl=ttl,
                 execution_profiles=execution_profiles,
+                enable_circuit_breaker=enable_circuit_breaker,
+                circuit_breaker_config=circuit_breaker_config,
             )
 
             yield store
@@ -939,22 +1157,41 @@ class AsyncScyllaDBStore(BaseStore):
         # Set keyspace
         self.session.set_keyspace(self.keyspace)
 
-        # Create main store table
-        await self._execute_async("""
-            CREATE TABLE IF NOT EXISTS store (
-                prefix text,
-                key text,
-                value text,
-                created_at timestamp,
-                updated_at timestamp,
-                ttl_minutes int,
-                PRIMARY KEY (prefix, key)
-            )
-        """)
+        # Create main store table with optional embedding column
+        embedding_dims = self.index_config.get("dims") if self.index_config else None
 
-        # Create secondary indexes if configured
-        if self.index_config.get("enable_sai"):
-            indexed_fields = self.index_config.get("indexed_fields", [])
+        if embedding_dims:
+            # Create table with embedding column
+            await self._execute_async(f"""
+                CREATE TABLE IF NOT EXISTS store (
+                    prefix text,
+                    key text,
+                    value text,
+                    created_at timestamp,
+                    updated_at timestamp,
+                    ttl_seconds int,
+                    embedding vector<float, {embedding_dims}>,
+                    PRIMARY KEY (prefix, key)
+                )
+            """)
+            logger.info(f"Created store table with embedding column (dims={embedding_dims})")
+        else:
+            # Create table without embedding column
+            await self._execute_async("""
+                CREATE TABLE IF NOT EXISTS store (
+                    prefix text,
+                    key text,
+                    value text,
+                    created_at timestamp,
+                    updated_at timestamp,
+                    ttl_seconds int,
+                    PRIMARY KEY (prefix, key)
+                )
+            """)
+
+        # Create SAI secondary indexes if configured
+        if self.sai_config.get("enable_sai"):
+            indexed_fields = self.sai_config.get("indexed_fields", [])
             for field in indexed_fields:
                 safe_field = field.replace(".", "_")
                 try:
@@ -1280,8 +1517,8 @@ class AsyncScyllaDBStore(BaseStore):
         row = result[0]
 
         # Refresh TTL if requested and TTL is set
-        if should_refresh and row.ttl_minutes:
-            await self._refresh_ttl(prefix, key, row.ttl_minutes)
+        if should_refresh and row.ttl_seconds:
+            await self._refresh_ttl(prefix, key, row.ttl_seconds)
 
         return self._row_to_item(row, namespace, key)
 
@@ -1319,31 +1556,53 @@ class AsyncScyllaDBStore(BaseStore):
         value_json = json.dumps(value)
         now = datetime.now(timezone.utc)
 
-        # Determine TTL
-        # Note: ttl parameter is in seconds, but we store ttl_minutes for compatibility
-        ttl_minutes = None
+        # Determine TTL (all in seconds for precision)
         ttl_seconds = None
 
         if ttl is not NOT_PROVIDED:
             if ttl is not None:
-                ttl_seconds = int(ttl)  # ttl is already in seconds
-                ttl_minutes = int(ttl / 60)  # convert to minutes for storage
+                ttl_seconds = int(ttl)  # ttl parameter is in seconds
         elif self.ttl_config.get("default_ttl"):
-            default_ttl_seconds = self.ttl_config["default_ttl"]
-            ttl_seconds = int(default_ttl_seconds)
-            ttl_minutes = int(default_ttl_seconds / 60)
+            ttl_seconds = int(self.ttl_config["default_ttl"])
 
-        # Use pre-prepared statement
-        if ttl_seconds:
-            await self._execute_prepared(
-                "put_with_ttl",
-                (prefix, key, value_json, now, now, ttl_minutes, ttl_seconds)
-            )
+        # Generate embedding if IndexConfig is set and indexing not disabled
+        embedding = None
+        if self.index_config and index is not False:
+            # Override fields if index parameter provides specific fields
+            if isinstance(index, list):
+                # Temporarily override fields for this operation
+                original_fields = self.index_config.get("fields")
+                self.index_config["fields"] = index
+                embedding = await self._generate_embedding(value)
+                self.index_config["fields"] = original_fields
+            else:
+                embedding = await self._generate_embedding(value)
+
+        # Use appropriate prepared statement based on embedding and TTL
+        if self.index_config:
+            # Store with embedding column
+            if ttl_seconds:
+                await self._execute_prepared(
+                    "put_with_embedding_ttl",
+                    (prefix, key, value_json, now, now, ttl_seconds, embedding, ttl_seconds)
+                )
+            else:
+                await self._execute_prepared(
+                    "put_with_embedding",
+                    (prefix, key, value_json, now, now, None, embedding)
+                )
         else:
-            await self._execute_prepared(
-                "put_no_ttl",
-                (prefix, key, value_json, now, now, ttl_minutes)
-            )
+            # Store without embedding column (legacy behavior)
+            if ttl_seconds:
+                await self._execute_prepared(
+                    "put_with_ttl",
+                    (prefix, key, value_json, now, now, ttl_seconds, ttl_seconds)
+                )
+            else:
+                await self._execute_prepared(
+                    "put_no_ttl",
+                    (prefix, key, value_json, now, now, None)
+                )
 
     async def adelete(
         self,
@@ -1415,23 +1674,21 @@ class AsyncScyllaDBStore(BaseStore):
         value_json = json.dumps(value)
         now = datetime.now(timezone.utc)
 
-        # Determine TTL
+        # Determine TTL (in seconds)
         ttl_seconds = None
-        ttl_minutes = None
         if ttl is not None:
             ttl_seconds = int(ttl)
-            ttl_minutes = int(ttl / 60)
 
         # Execute LWT
         if ttl_seconds:
             result = await self._execute_prepared(
                 "put_if_not_exists_with_ttl",
-                (prefix, key, value_json, now, now, ttl_minutes, ttl_seconds)
+                (prefix, key, value_json, now, now, ttl_seconds, ttl_seconds)
             )
         else:
             result = await self._execute_prepared(
                 "put_if_not_exists_no_ttl",
-                (prefix, key, value_json, now, now, ttl_minutes)
+                (prefix, key, value_json, now, now, None)
             )
 
         # Check [applied] column
@@ -1652,66 +1909,84 @@ class AsyncScyllaDBStore(BaseStore):
         """
         Search for items within a namespace prefix.
 
+        Supports both semantic search (when query provided and IndexConfig set)
+        and filter-based search.
+
         Args:
             namespace_prefix: Path prefix to search within
-            query: Natural language query (not fully supported in ScyllaDB)
+            query: Natural language query for semantic search
             filter: Key-value pairs for filtering results
             limit: Maximum items to return
             offset: Number of items to skip (pagination)
             refresh_ttl: Whether to refresh TTL on read
             fetch_size: Page size for query paging (default: 5000)
-                       Larger values = fewer round trips but more memory
-                       Smaller values = more round trips but less memory
 
         Returns:
-            List of SearchItem objects
+            List of SearchItem objects sorted by relevance
 
         Note:
-            Uses efficient token-range query to scan partitions matching prefix.
-            Filters are applied in Python after fetching. For complex filtering,
-            consider using ScyllaDB's SAI indexes.
-
-            Query paging is automatically handled by the driver with the specified
-            fetch_size. This prevents memory issues when scanning large tables.
+            - With query + IndexConfig: Returns results sorted by semantic similarity
+            - Without query: Returns results sorted by recency
+            - Filters are always applied regardless of search mode
         """
         self._validate_namespace(namespace_prefix)
 
+        # If query provided and semantic search enabled, use semantic search
+        if query and self.index_config:
+            return await self._semantic_search(
+                namespace_prefix, query, filter, limit, offset, refresh_ttl, fetch_size
+            )
+
+        # Otherwise, use filter-based search
+        return await self._filter_search(
+            namespace_prefix, filter, limit, offset, refresh_ttl, fetch_size
+        )
+
+    async def _filter_search(
+        self,
+        namespace_prefix: tuple[str, ...],
+        filter: dict[str, Any] | None,
+        limit: int,
+        offset: int,
+        refresh_ttl: bool | None,
+        fetch_size: int | None,
+    ) -> list[SearchItem]:
+        """Filter-based search (original implementation)."""
         prefix = self._namespace_to_prefix(namespace_prefix)
         should_refresh = refresh_ttl if refresh_ttl is not None else self.ttl_config.get("refresh_on_read", True)
 
-        # Use token-range query for efficient full table scan
-        # This avoids ALLOW FILTERING by scanning all partitions efficiently
-        # Set fetch_size for automatic paging (default: 5000 rows per page)
         from cassandra.query import SimpleStatement
 
-        query_str = "SELECT * FROM store"
+        query_str = f"SELECT * FROM {self.keyspace}.store"
         statement = SimpleStatement(query_str, fetch_size=fetch_size or 5000)
 
-        # Execute with automatic paging
         results = await self._execute_async(statement, None)
 
         if not results:
             return []
 
-        # Filter by prefix and apply custom filters in Python
         items = []
         for row in results:
-            # Check if prefix matches (startswith for hierarchical matching)
             if not row.prefix.startswith(prefix):
                 continue
 
             value = json.loads(row.value)
 
-            # Apply custom filters
             if filter and not self._matches_filter(value, filter):
                 continue
 
-            # Convert namespace
             ns = self._prefix_to_namespace(row.prefix)
 
-            # Refresh TTL if needed
-            if should_refresh and row.ttl_minutes:
-                await self._refresh_ttl(row.prefix, row.key, row.ttl_minutes)
+            if should_refresh and row.ttl_seconds:
+                await self._refresh_ttl(row.prefix, row.key, row.ttl_seconds)
+
+            score = self._calculate_relevance_score(
+                value=value,
+                filter=filter,
+                created_at=row.created_at,
+                updated_at=row.updated_at,
+                query=None
+            )
 
             items.append(SearchItem(
                 value=value,
@@ -1719,11 +1994,140 @@ class AsyncScyllaDBStore(BaseStore):
                 namespace=ns,
                 created_at=row.created_at,
                 updated_at=row.updated_at,
-                score=1.0  # No vector search, all scores are 1.0
+                score=score
             ))
+
+        return items[offset:offset + limit]
+
+    async def _semantic_search(
+        self,
+        namespace_prefix: tuple[str, ...],
+        query: str,
+        filter: dict[str, Any] | None,
+        limit: int,
+        offset: int,
+        refresh_ttl: bool | None,
+        fetch_size: int | None,
+    ) -> list[SearchItem]:
+        """Semantic search using vector embeddings and cosine similarity."""
+        try:
+            from sklearn.metrics.pairwise import cosine_similarity
+        except ImportError:
+            logger.warning(
+                "sklearn not available for semantic search, falling back to filter search"
+            )
+            return await self._filter_search(
+                namespace_prefix, filter, limit, offset, refresh_ttl, fetch_size
+            )
+
+        prefix = self._namespace_to_prefix(namespace_prefix)
+        should_refresh = refresh_ttl if refresh_ttl is not None else self.ttl_config.get("refresh_on_read", True)
+
+        # Generate query embedding
+        query_embedding = await self._generate_query_embedding(query)
+        if not query_embedding:
+            logger.warning("Failed to generate query embedding, falling back to filter search")
+            return await self._filter_search(
+                namespace_prefix, filter, limit, offset, refresh_ttl, fetch_size
+            )
+
+        # Fetch all candidates with embeddings
+        from cassandra.query import SimpleStatement
+
+        query_str = f"SELECT * FROM {self.keyspace}.store"
+        statement = SimpleStatement(query_str, fetch_size=fetch_size or 5000)
+
+        results = await self._execute_async(statement, None)
+
+        if not results:
+            return []
+
+        # Collect items with embeddings
+        candidates = []
+        for row in results:
+            if not row.prefix.startswith(prefix):
+                continue
+
+            value = json.loads(row.value)
+
+            if filter and not self._matches_filter(value, filter):
+                continue
+
+            # Skip if no embedding
+            if not hasattr(row, 'embedding') or row.embedding is None:
+                continue
+
+            ns = self._prefix_to_namespace(row.prefix)
+
+            candidates.append({
+                'item': SearchItem(
+                    value=value,
+                    key=row.key,
+                    namespace=ns,
+                    created_at=row.created_at,
+                    updated_at=row.updated_at,
+                    score=0.0  # Will be updated
+                ),
+                'embedding': row.embedding,
+                'row': row
+            })
+
+        if not candidates:
+            return []
+
+        # Compute similarities using sklearn
+        embeddings = [c['embedding'] for c in candidates]
+        similarities = cosine_similarity([query_embedding], embeddings)[0]
+
+        # Update scores and create results
+        items = []
+        for i, candidate in enumerate(candidates):
+            item = candidate['item']
+            item.score = float(similarities[i])
+
+            # Refresh TTL if needed
+            if should_refresh and candidate['row'].ttl_seconds:
+                await self._refresh_ttl(
+                    candidate['row'].prefix,
+                    candidate['row'].key,
+                    candidate['row'].ttl_seconds
+                )
+
+            items.append(item)
+
+        # Sort by similarity score (descending)
+        items.sort(key=lambda x: x.score, reverse=True)
 
         # Apply offset and limit
         return items[offset:offset + limit]
+
+    async def _generate_query_embedding(self, query: str) -> list[float] | None:
+        """
+        Generate embedding for a search query.
+
+        Uses a separate RETRIEVAL_QUERY task type if the embedding supports it.
+        """
+        if not self.index_config:
+            return None
+
+        try:
+            embed = self.index_config["embed"]
+
+            # Check if it's a LangChain Embeddings instance
+            if hasattr(embed, 'embed_query'):
+                # Use embed_query for queries (may use different task type)
+                return embed.embed_query(query)
+            elif asyncio.iscoroutinefunction(embed):
+                return await embed(query)
+            elif callable(embed):
+                loop = asyncio.get_running_loop()
+                return await loop.run_in_executor(None, embed, query)
+            else:
+                raise ValueError(f"Unsupported embedding type: {type(embed)}")
+
+        except Exception as e:
+            logger.error(f"Failed to generate query embedding: {e}", exc_info=e)
+            return None
 
     async def alist_namespaces(
         self,
@@ -2258,6 +2662,28 @@ class AsyncScyllaDBStore(BaseStore):
 
     # Synchronous wrappers (for BaseStore compatibility)
 
+    def _run_async(self, coro):
+        """
+        Run async coroutine, handling existing event loop gracefully.
+
+        If called from within an async context, raises RuntimeError with helpful message.
+        Otherwise creates new event loop to run the coroutine.
+        """
+        try:
+            # Check if there's a running event loop
+            loop = asyncio.get_running_loop()
+            # If we get here, we're already in an async context
+            raise RuntimeError(
+                "Cannot use synchronous methods from within an async context. "
+                "Use async methods (aget, aput, adelete, asearch, etc.) instead."
+            )
+        except RuntimeError as e:
+            # Check if this is the "no running loop" error (expected) vs our custom error (re-raise)
+            if "Cannot use synchronous methods" in str(e):
+                raise
+            # No running loop - safe to use asyncio.run()
+            return asyncio.run(coro)
+
     def get(
         self,
         namespace: tuple[str, ...],
@@ -2266,7 +2692,7 @@ class AsyncScyllaDBStore(BaseStore):
         refresh_ttl: bool | None = None,
     ) -> Item | None:
         """Synchronous wrapper for aget()."""
-        return asyncio.run(
+        return self._run_async(
             self.aget(namespace, key, refresh_ttl=refresh_ttl)
         )
 
@@ -2280,7 +2706,7 @@ class AsyncScyllaDBStore(BaseStore):
         ttl: float | None | type[NOT_PROVIDED] = NOT_PROVIDED,
     ) -> None:
         """Synchronous wrapper for aput()."""
-        return asyncio.run(
+        return self._run_async(
             self.aput(namespace, key, value, index, ttl=ttl)
         )
 
@@ -2290,7 +2716,7 @@ class AsyncScyllaDBStore(BaseStore):
         key: str,
     ) -> None:
         """Synchronous wrapper for adelete()."""
-        return asyncio.run(
+        return self._run_async(
             self.adelete(namespace, key)
         )
 
@@ -2306,7 +2732,7 @@ class AsyncScyllaDBStore(BaseStore):
         refresh_ttl: bool | None = None,
     ) -> list[SearchItem]:
         """Synchronous wrapper for asearch()."""
-        return asyncio.run(
+        return self._run_async(
             self.asearch(
                 namespace_prefix,
                 query=query,
@@ -2327,7 +2753,7 @@ class AsyncScyllaDBStore(BaseStore):
         offset: int = 0,
     ) -> list[tuple[str, ...]]:
         """Synchronous wrapper for alist_namespaces()."""
-        return asyncio.run(
+        return self._run_async(
             self.alist_namespaces(
                 prefix=prefix,
                 suffix=suffix,
@@ -2339,7 +2765,7 @@ class AsyncScyllaDBStore(BaseStore):
 
     def batch(self, ops: Iterable[Op]) -> list[Result]:
         """Synchronous wrapper for abatch()."""
-        return asyncio.run(
+        return self._run_async(
             self.abatch(ops)
         )
 
@@ -2516,11 +2942,11 @@ class AsyncScyllaDBStore(BaseStore):
             # Single item operations
             "get": "SELECT * FROM store WHERE prefix = ? AND key = ?",
             "put_no_ttl": """
-                INSERT INTO store (prefix, key, value, created_at, updated_at, ttl_minutes)
+                INSERT INTO store (prefix, key, value, created_at, updated_at, ttl_seconds)
                 VALUES (?, ?, ?, ?, ?, ?)
             """,
             "put_with_ttl": """
-                INSERT INTO store (prefix, key, value, created_at, updated_at, ttl_minutes)
+                INSERT INTO store (prefix, key, value, created_at, updated_at, ttl_seconds)
                 VALUES (?, ?, ?, ?, ?, ?)
                 USING TTL ?
             """,
@@ -2530,27 +2956,45 @@ class AsyncScyllaDBStore(BaseStore):
                 SET updated_at = ?
                 WHERE prefix = ? AND key = ?
             """,
+        }
 
+        # Add embedding statements if IndexConfig is set
+        if self.index_config:
+            embedding_statements = {
+                "put_with_embedding": """
+                    INSERT INTO store (prefix, key, value, created_at, updated_at, ttl_seconds, embedding)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                "put_with_embedding_ttl": """
+                    INSERT INTO store (prefix, key, value, created_at, updated_at, ttl_seconds, embedding)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    USING TTL ?
+                """,
+            }
+            statements.update(embedding_statements)
+
+        # Continue with batch and LWT operations
+        statements.update({
             # Batch operations
             "batch_get": "SELECT * FROM store WHERE prefix = ? AND key = ?",
             "batch_put_no_ttl": """
-                INSERT INTO store (prefix, key, value, created_at, updated_at, ttl_minutes)
+                INSERT INTO store (prefix, key, value, created_at, updated_at, ttl_seconds)
                 VALUES (?, ?, ?, ?, ?, ?)
             """,
             "batch_put_with_ttl": """
-                INSERT INTO store (prefix, key, value, created_at, updated_at, ttl_minutes)
+                INSERT INTO store (prefix, key, value, created_at, updated_at, ttl_seconds)
                 VALUES (?, ?, ?, ?, ?, ?)
                 USING TTL ?
             """,
 
             # Lightweight Transaction (LWT) operations
             "put_if_not_exists_no_ttl": """
-                INSERT INTO store (prefix, key, value, created_at, updated_at, ttl_minutes)
+                INSERT INTO store (prefix, key, value, created_at, updated_at, ttl_seconds)
                 VALUES (?, ?, ?, ?, ?, ?)
                 IF NOT EXISTS
             """,
             "put_if_not_exists_with_ttl": """
-                INSERT INTO store (prefix, key, value, created_at, updated_at, ttl_minutes)
+                INSERT INTO store (prefix, key, value, created_at, updated_at, ttl_seconds)
                 VALUES (?, ?, ?, ?, ?, ?)
                 IF NOT EXISTS
                 USING TTL ?
@@ -2589,7 +3033,7 @@ class AsyncScyllaDBStore(BaseStore):
                 WHERE prefix = ? AND key = ?
                 IF value = ?
             """,
-        }
+        })
 
         # Prepare all statements concurrently
         for name, query in statements.items():
@@ -2657,12 +3101,27 @@ class AsyncScyllaDBStore(BaseStore):
         return list(result) if result else []
 
     def _namespace_to_prefix(self, namespace: tuple[str, ...]) -> str:
-        """Convert namespace tuple to dot-separated prefix string."""
-        return ".".join(namespace)
+        """
+        Convert namespace tuple to prefix string using URL encoding.
+
+        This prevents collisions like ("a.b", "c") vs ("a", "b.c") by encoding
+        dots and other special characters in namespace labels.
+        """
+        import urllib.parse
+        # URL-encode each label to escape dots and special chars, then join with unencoded dots
+        encoded_labels = [urllib.parse.quote(label, safe='') for label in namespace]
+        return ".".join(encoded_labels)
 
     def _prefix_to_namespace(self, prefix: str) -> tuple[str, ...]:
-        """Convert dot-separated prefix string to namespace tuple."""
-        return tuple(prefix.split("."))
+        """
+        Convert prefix string back to namespace tuple using URL decoding.
+
+        Reverses the encoding done in _namespace_to_prefix.
+        """
+        import urllib.parse
+        # Split on dots, then URL-decode each label
+        encoded_labels = prefix.split(".")
+        return tuple(urllib.parse.unquote(label) for label in encoded_labels)
 
     def _validate_namespace(self, namespace: tuple[str, ...]) -> None:
         """
@@ -2713,12 +3172,8 @@ class AsyncScyllaDBStore(BaseStore):
                     value=label
                 )
 
-            if "." in label:
-                raise StoreValidationError(
-                    f"Namespace label at position {i} cannot contain periods ('.')",
-                    field=f"namespace[{i}]",
-                    value=label
-                )
+            # Note: Dots are now allowed in labels since we use URL encoding
+            # to prevent collisions. The validation for dots has been removed.
 
             if len(label) > ValidationLimits.MAX_NAMESPACE_LABEL_LENGTH:
                 raise StoreValidationError(
@@ -2866,10 +3321,97 @@ class AsyncScyllaDBStore(BaseStore):
 
         return current
 
-    async def _refresh_ttl(self, prefix: str, key: str, ttl_minutes: int) -> None:
-        """Refresh TTL for an item."""
+    def _calculate_relevance_score(
+        self,
+        value: dict[str, Any],
+        filter: dict[str, Any] | None,
+        created_at: datetime,
+        updated_at: datetime,
+        query: str | None
+    ) -> float:
+        """
+        Calculate relevance score for search results.
+
+        Scoring formula combines multiple signals:
+        - Recency: More recently updated items score higher (0.0-0.4)
+        - Text relevance: Query matches in value boost score (0.0-0.3)
+        - Filter quality: Exact filter matches boost score (0.0-0.3)
+        - Base score: All items start with 0.0
+
+        Returns:
+            Float between 0.0 and 1.0 (higher is more relevant)
+        """
+        score = 0.0
+
+        # Component 1: Recency score (40% weight)
+        # Items updated within last 24h get bonus, decaying over 30 days
         now = datetime.now(timezone.utc)
-        ttl_seconds = ttl_minutes * 60
+
+        # Make updated_at timezone-aware if it's naive
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+
+        age_seconds = (now - updated_at).total_seconds()
+
+        if age_seconds < 86400:  # < 24 hours
+            recency_score = 0.4
+        elif age_seconds < 604800:  # < 7 days
+            recency_score = 0.3
+        elif age_seconds < 2592000:  # < 30 days
+            recency_score = 0.2
+        else:
+            recency_score = 0.1
+
+        score += recency_score
+
+        # Component 2: Text relevance (30% weight)
+        if query:
+            query_lower = query.lower()
+            value_text = json.dumps(value).lower()
+
+            # Simple text matching - boost score if query terms found
+            query_terms = query_lower.split()
+            matches = sum(1 for term in query_terms if term in value_text)
+
+            if matches > 0:
+                # Normalize by number of query terms
+                text_score = min(0.3, (matches / len(query_terms)) * 0.3)
+                score += text_score
+
+        # Component 3: Filter match quality (30% weight)
+        if filter:
+            # Count how many filter conditions are satisfied
+            total_conditions = len(filter)
+            matched_conditions = 0
+
+            for key, condition in filter.items():
+                field_value = self._get_nested_value(value, key)
+
+                if isinstance(condition, dict):
+                    # Operator-based filter - check if it passes
+                    for op, target in condition.items():
+                        if op == "$eq" and field_value == target:
+                            matched_conditions += 1
+                        elif op == "$ne" and field_value != target:
+                            matched_conditions += 1
+                        elif op in ("$gt", "$gte", "$lt", "$lte"):
+                            # Range queries get partial credit
+                            matched_conditions += 0.5
+                else:
+                    # Simple equality - full credit
+                    if field_value == condition:
+                        matched_conditions += 1
+
+            if total_conditions > 0:
+                filter_score = (matched_conditions / total_conditions) * 0.3
+                score += filter_score
+
+        # Ensure score is within [0.0, 1.0]
+        return min(1.0, max(0.0, score))
+
+    async def _refresh_ttl(self, prefix: str, key: str, ttl_seconds: int) -> None:
+        """Refresh TTL for an item (ttl_seconds is already in seconds)."""
+        now = datetime.now(timezone.utc)
         await self._execute_prepared("refresh_ttl", (ttl_seconds, now, prefix, key))
 
     # Batch operation helpers
@@ -2912,9 +3454,9 @@ class AsyncScyllaDBStore(BaseStore):
                 should_refresh = op.refresh_ttl if op.refresh_ttl is not None else self.ttl_config.get("refresh_on_read", True)
 
                 # Refresh TTL if needed
-                if should_refresh and row.ttl_minutes:
+                if should_refresh and row.ttl_seconds:
                     prefix = self._namespace_to_prefix(op.namespace)
-                    await self._refresh_ttl(prefix, op.key, row.ttl_minutes)
+                    await self._refresh_ttl(prefix, op.key, row.ttl_seconds)
 
                 results[idx] = self._row_to_item(row, op.namespace, op.key)
             else:
@@ -2959,25 +3501,21 @@ class AsyncScyllaDBStore(BaseStore):
             prefix = self._namespace_to_prefix(op.namespace)
             value_json = json.dumps(op.value)
 
-            # Determine TTL
-            ttl_minutes = None
+            # Determine TTL (in seconds)
             ttl_seconds = None
 
             if op.ttl is not NOT_PROVIDED and op.ttl is not None:
                 ttl_seconds = int(op.ttl)
-                ttl_minutes = int(op.ttl / 60)
             elif self.ttl_config.get("default_ttl"):
-                default_ttl_seconds = self.ttl_config["default_ttl"]
-                ttl_seconds = int(default_ttl_seconds)
-                ttl_minutes = int(default_ttl_seconds / 60)
+                ttl_seconds = int(self.ttl_config["default_ttl"])
 
             # Add to batch with appropriate prepared statement
             if ttl_seconds:
                 prepared = self._prepared_statements.get("batch_put_with_ttl")
-                batch.add(prepared, (prefix, op.key, value_json, now, now, ttl_minutes, ttl_seconds))
+                batch.add(prepared, (prefix, op.key, value_json, now, now, ttl_seconds, ttl_seconds))
             else:
                 prepared = self._prepared_statements.get("batch_put_no_ttl")
-                batch.add(prepared, (prefix, op.key, value_json, now, now, ttl_minutes))
+                batch.add(prepared, (prefix, op.key, value_json, now, now, None))
 
         # Execute batch atomically
         loop = asyncio.get_running_loop()
@@ -3017,14 +3555,14 @@ class AsyncScyllaDBStore(BaseStore):
         ops_without_ttl = []
 
         for idx, op in put_ops:
-            ttl_minutes = None
+            ttl_seconds = None
             if op.ttl is not NOT_PROVIDED and op.ttl is not None:
-                ttl_minutes = int(op.ttl)
+                ttl_seconds = int(op.ttl)
             elif self.ttl_config.get("default_ttl"):
-                ttl_minutes = int(self.ttl_config["default_ttl"])
+                ttl_seconds = int(self.ttl_config["default_ttl"])
 
-            if ttl_minutes:
-                ops_with_ttl.append((idx, op, ttl_minutes))
+            if ttl_seconds:
+                ops_with_ttl.append((idx, op, ttl_seconds))
             else:
                 ops_without_ttl.append((idx, op))
 
@@ -3060,11 +3598,10 @@ class AsyncScyllaDBStore(BaseStore):
 
             params_list = []
             now = datetime.now(timezone.utc)
-            for idx, op, ttl_minutes in ops_with_ttl:
+            for idx, op, ttl_seconds in ops_with_ttl:
                 prefix = self._namespace_to_prefix(op.namespace)
                 value_json = json.dumps(op.value)
-                ttl_seconds = ttl_minutes * 60
-                params_list.append((prefix, op.key, value_json, now, now, ttl_minutes, ttl_seconds))
+                params_list.append((prefix, op.key, value_json, now, now, ttl_seconds, ttl_seconds))
 
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(

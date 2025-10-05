@@ -1,8 +1,6 @@
-version: '3.8'
-
 services:
   scylla:
-    image: scylladb/scylla:2025.3
+    image: scylladb/scylla:2025.3.1
     container_name: scylladb
     ports:
       - "9042:9042"  # CQL native transport port
