@@ -20,8 +20,37 @@ services:
     networks:
       - scylla_network
 
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"  # REST API
+      - "6334:6334"  # gRPC API (faster)
+    expose:
+      - "6333"
+      - "6334"
+      - "6335"  # Internal metrics
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      - QDRANT__LOG_LEVEL=INFO
+    networks:
+      - scylla_network
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:6333/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      scylla:
+        condition: service_healthy
+
 volumes:
   scylla_data:
+    driver: local
+  qdrant_data:
     driver: local
 
 networks:
