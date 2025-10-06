@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.0] - 2025-10-05
+## [1.0.0] - 2025-10-06
 
 ### Added
 
@@ -46,12 +46,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Graceful degradation
 
 #### Testing
-- **Comprehensive Test Suite**: 52 tests with 100% pass rate
-  - Unit tests for fast validation
-  - Integration tests with ScyllaDB/Qdrant
-  - Load tests for performance validation
-  - Chaos tests for failure scenarios
-- **Test Coverage**: 85%+ code coverage
+- **Comprehensive Test Suite**: 173 tests with 100% pass rate
+  - Connection lifecycle tests (8 tests)
+  - CRUD operations tests (15 tests)
+  - Error handling tests (12 tests)
+  - Search functionality tests (17 tests)
+  - Production features tests (21 tests)
+  - Rate limiter tests (27 tests)
+  - Configuration tests (44 tests)
+  - Store edge cases tests (14 tests)
+  - Store advanced tests (15 tests)
+- **Test Coverage**: 57% overall coverage
+  - `rate_limiter.py`: 92%
+  - `logging_utils.py`: 88%
+  - `config.py`: 84%
+  - `store.py`: 55%
+  - `__init__.py`: 100%
 - **Mock Embeddings**: Deterministic testing without API calls
 
 #### Documentation
@@ -103,11 +113,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 This is the first production-ready release of Vertector ScyllaDB Store. The package has been thoroughly tested and is ready for production use in high-scale applications.
 
 **Highlights**:
-- ✅ 52/52 tests passing (100% pass rate)
-- ✅ Production readiness score: 95/100
+- ✅ 173/173 tests passing (100% pass rate)
+- ✅ 57% code coverage (critical paths fully tested)
 - ✅ Full observability with OpenTelemetry
 - ✅ Enterprise-grade security (TLS, auth, secrets)
 - ✅ Comprehensive documentation
+- ✅ Production-ready with graceful shutdown and health checks
 
 **Breaking Changes**: None (initial release)
 

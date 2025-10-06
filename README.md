@@ -5,7 +5,8 @@ Production-ready ScyllaDB + Qdrant store with vector search capabilities. Built 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![PyPI version](https://img.shields.io/pypi/v/vertector-scylladbstore.svg)](https://pypi.org/project/vertector-scylladbstore/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-52%2F52%20passing-brightgreen.svg)](https://github.com/vertector/vertector-scylladbstore)
+[![Tests](https://img.shields.io/badge/tests-173%2F173%20passing-brightgreen.svg)](https://github.com/vertector/vertector-scylladbstore)
+[![Coverage](https://img.shields.io/badge/coverage-57%25-yellow.svg)](https://github.com/vertector/vertector-scylladbstore)
 [![Production Ready](https://img.shields.io/badge/production-ready-brightgreen.svg)](https://github.com/vertector/vertector-scylladbstore)
 
 ## Features
@@ -24,7 +25,7 @@ Production-ready ScyllaDB + Qdrant store with vector search capabilities. Built 
 - 🛡️ **Resilience** - Circuit breaker, exponential backoff, configurable retries
 - ⚡ **Performance** - LRU caching, batch embeddings, parallel processing (66-70 docs/sec)
 - 🚦 **Rate Limiting** - Token bucket and sliding window algorithms
-- ✅ **Testing** - Comprehensive test suite (52/52 tests passing)
+- ✅ **Testing** - Comprehensive test suite (173/173 tests passing, 57% coverage)
 
 ## Quick Start
 
