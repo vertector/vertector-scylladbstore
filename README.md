@@ -125,7 +125,7 @@ pytest
 ## Production Configuration
 
 ```python
-from config import load_config_from_env, ScyllaDBStoreConfig, AuthConfig, TLSConfig
+from vertector_scylladbstore.config import load_config_from_env, ScyllaDBStoreConfig, AuthConfig, TLSConfig
 
 # Load from environment variables
 config = load_config_from_env()
@@ -222,7 +222,7 @@ async with AsyncScyllaDBStore.from_config(config) as store:
    await asyncio.gather(*tasks)
    ```
 
-See [docs/performance.md](docs/performance.md) for detailed tuning guide.
+See the Performance section above for optimization tips.
 
 ## Testing
 
@@ -239,12 +239,12 @@ pytest -m unit
 pytest -m integration
 
 # Run with coverage
-pytest --cov=scylladb_store --cov-report=html
+pytest --cov=src --cov-report=html
 ```
 
 ### Test Coverage
 
-Current coverage: **85%+**
+Current coverage: **57%**
 
 - ✅ Connection lifecycle
 - ✅ CRUD operations
@@ -266,7 +266,7 @@ Current coverage: **85%+**
 - [ ] **Scaling**: Auto-scaling configured, resource limits set
 - [ ] **Disaster Recovery**: Multi-region setup, tested failover
 
-See [docs/deployment.md](docs/deployment.md) for complete deployment guide.
+See [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) for complete deployment guide.
 
 ### Docker Deployment
 
@@ -298,15 +298,9 @@ kubectl rollout status deployment/scylla-store -n production
 
 ## Documentation
 
-### User Guides
-- [Deployment Guide](docs/deployment.md) - Production deployment procedures
-- [Operations Runbook](docs/operations.md) - Day-to-day operations
-- [Troubleshooting Guide](docs/troubleshooting.md) - Common issues and solutions
-
-### Reference
-- [API Reference](docs/api.md) - Complete API documentation
-- [Configuration Reference](docs/configuration.md) - All config options
-- [Architecture Overview](docs/architecture.md) - System design details
+- [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) - Production deployment guide
+- [CONTRIBUTING.md](CONTRIBUTING.md) - Team collaboration guidelines
+- [CHANGELOG.md](CHANGELOG.md) - Release notes and version history
 
 ### Examples
 - [Basic CRUD Operations](test_crud_ops.ipynb) - Jupyter notebook examples
@@ -348,7 +342,7 @@ OTLP_ENDPOINT=http://otel-collector:4317
 PROMETHEUS_PORT=9090
 ```
 
-See [config.py](config.py) for complete configuration model with Pydantic validation.
+See [src/vertector_scylladbstore/config.py](src/vertector_scylladbstore/config.py) for complete configuration model with Pydantic validation.
 
 ## Monitoring
 
@@ -373,11 +367,11 @@ scylladb_circuit_breaker_state{name="scylla|qdrant"}
 
 ### Grafana Dashboard
 
-Import the pre-built dashboard from [grafana/dashboard.json](grafana/dashboard.json).
+You can build custom dashboards using the Prometheus metrics above.
 
 ### Alerts
 
-Critical alerts are sent to PagerDuty, warnings to Slack. See [docs/operations.md#monitoring-and-alerting](docs/operations.md#monitoring-and-alerting).
+Configure alerts in your monitoring system based on the metrics exposed.
 
 ## Security
 
@@ -426,21 +420,18 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guid
 
 ```bash
 # Install development dependencies
-pip install -r requirements-dev.txt
-
-# Install pre-commit hooks
-pre-commit install
+pip install -e ".[dev]"
 
 # Run tests
 pytest
 
 # Format code
-black .
-isort .
+black src/ tests/
+isort src/ tests/
 
 # Lint
-flake8 .
-mypy .
+ruff check src/ tests/
+mypy src/
 ```
 
 ## License
@@ -449,10 +440,9 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ## Support
 
-- 📧 Email: support@example.com
-- 💬 Slack: [Join our workspace](https://example.slack.com)
-- 🐛 Issues: [GitHub Issues](https://github.com/example/scylla-store/issues)
-- 📖 Docs: [Full Documentation](https://docs.example.com)
+- 📧 Email: dev-team@vertector.com
+- 🐛 Issues: [GitHub Issues](https://github.com/vertector/vertector-scylladbstore/issues)
+- 📖 Docs: See [CONTRIBUTING.md](CONTRIBUTING.md) for team resources
 
 ## Roadmap
 
