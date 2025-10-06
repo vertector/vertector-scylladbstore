@@ -898,6 +898,8 @@ class AsyncScyllaDBStore(BaseStore):
         enable_alerting: bool = False,
         qdrant_url: str = "http://localhost:6333",
         qdrant_collection: str | None = None,
+        query_timeout: float = 10.0,
+        qdrant_timeout: float = 5.0,
     ) -> None:
         """
         Initialize ScyllaDB store with Qdrant (REQUIRED for semantic search).
@@ -918,7 +920,12 @@ class AsyncScyllaDBStore(BaseStore):
             enable_alerting: Enable alert manager (default: False)
             qdrant_url: Qdrant server URL (REQUIRED, default: http://localhost:6333)
             qdrant_collection: Qdrant collection name (default: keyspace name)
+            query_timeout: Timeout for ScyllaDB queries in seconds (default: 10.0)
+            qdrant_timeout: Timeout for Qdrant operations in seconds (default: 5.0)
         """
+        # Validate keyspace name to prevent CQL injection
+        self._validate_keyspace(keyspace)
+
         self.session = session
         self.keyspace = keyspace
         self.deserializer = deserializer or json.loads
@@ -926,6 +933,8 @@ class AsyncScyllaDBStore(BaseStore):
         self.sai_config = sai_index or {}
         self.ttl_config = ttl or {}
         self.execution_profiles = execution_profiles or {}
+        self.query_timeout = query_timeout
+        self.qdrant_timeout = qdrant_timeout
         self.lock = asyncio.Lock()
         self._ttl_sweeper_task: asyncio.Task | None = None
         self._ttl_stop_event = asyncio.Event()
@@ -1096,6 +1105,31 @@ class AsyncScyllaDBStore(BaseStore):
                 parts.append(str(value[field]))
 
         return " ".join(parts)
+
+    async def _with_qdrant_timeout(self, coro, operation: str = "qdrant_operation"):
+        """
+        Execute Qdrant operation with timeout.
+
+        Args:
+            coro: Coroutine to execute
+            operation: Operation name for error messages
+
+        Returns:
+            Result from coroutine
+
+        Raises:
+            StoreTimeoutError: If operation times out
+        """
+        try:
+            return await asyncio.wait_for(coro, timeout=self.qdrant_timeout)
+        except asyncio.TimeoutError:
+            error_msg = f"Qdrant {operation} timed out after {self.qdrant_timeout}s"
+            logger.error(error_msg)
+            raise StoreTimeoutError(
+                error_msg,
+                operation=operation,
+                timeout_seconds=self.qdrant_timeout
+            )
 
     async def _generate_embedding(
         self,
@@ -2700,11 +2734,14 @@ class AsyncScyllaDBStore(BaseStore):
         # Fetch extra to account for namespace filtering and offset
         fetch_limit = min((limit + offset) * 2 + 20, 1000)
 
-        search_results = await self.qdrant_client.query_points(
-            collection_name=self.qdrant_collection,
-            query=query_embedding,
-            limit=fetch_limit,
-            with_payload=True,
+        search_results = await self._with_qdrant_timeout(
+            self.qdrant_client.query_points(
+                collection_name=self.qdrant_collection,
+                query=query_embedding,
+                limit=fetch_limit,
+                with_payload=True,
+            ),
+            operation="search"
         )
 
         # Filter by namespace prefix client-side and collect keys for batch fetch
@@ -3860,6 +3897,60 @@ class AsyncScyllaDBStore(BaseStore):
         encoded_labels = prefix.split(".")
         return tuple(urllib.parse.unquote(label) for label in encoded_labels)
 
+    def _validate_keyspace(self, keyspace: str) -> None:
+        """
+        Validate keyspace name to prevent CQL injection.
+
+        Args:
+            keyspace: Keyspace name
+
+        Raises:
+            StoreValidationError: If keyspace name is invalid
+        """
+        if not keyspace:
+            raise StoreValidationError(
+                "Keyspace name cannot be empty",
+                field="keyspace",
+                value=keyspace
+            )
+
+        if not isinstance(keyspace, str):
+            raise StoreValidationError(
+                f"Keyspace must be a string, got {type(keyspace).__name__}",
+                field="keyspace",
+                value=keyspace
+            )
+
+        # CQL identifier rules: alphanumeric and underscore only, must start with letter
+        import re
+        if not re.match(r'^[a-zA-Z][a-zA-Z0-9_]*$', keyspace):
+            raise StoreValidationError(
+                "Keyspace name must start with a letter and contain only alphanumeric characters and underscores",
+                field="keyspace",
+                value=keyspace
+            )
+
+        # Check length (CQL limit is 48 characters for identifiers)
+        if len(keyspace) > 48:
+            raise StoreValidationError(
+                f"Keyspace name exceeds maximum length (48 characters): {len(keyspace)}",
+                field="keyspace",
+                value=keyspace
+            )
+
+        # Prevent reserved CQL keywords
+        cql_keywords = {
+            'select', 'insert', 'update', 'delete', 'drop', 'create', 'alter',
+            'truncate', 'use', 'grant', 'revoke', 'from', 'where', 'and', 'or',
+            'table', 'keyspace', 'index', 'materialized', 'view', 'type'
+        }
+        if keyspace.lower() in cql_keywords:
+            raise StoreValidationError(
+                f"Keyspace name '{keyspace}' is a reserved CQL keyword",
+                field="keyspace",
+                value=keyspace
+            )
+
     def _validate_namespace(self, namespace: tuple[str, ...]) -> None:
         """
         Validate namespace tuple with comprehensive checks.
@@ -4521,3 +4612,125 @@ class AsyncScyllaDBStore(BaseStore):
                 limit=op.limit,
                 offset=op.offset,
             )
+
+    async def aclose(self) -> None:
+        """
+        Gracefully shutdown the store and cleanup resources.
+
+        This method:
+        - Stops TTL sweeper task
+        - Closes Qdrant client connection
+        - Clears prepared statement cache
+        - Clears embedding cache
+        - Does NOT close the ScyllaDB session (caller's responsibility)
+
+        Example:
+            async with AsyncScyllaDBStore.from_contact_points(...) as store:
+                # ... use store
+                pass  # aclose() called automatically
+
+            # Or manually:
+            store = AsyncScyllaDBStore(...)
+            try:
+                await store.setup()
+                # ... use store
+            finally:
+                await store.aclose()
+        """
+        logger.info(f"Shutting down AsyncScyllaDBStore for keyspace '{self.keyspace}'...")
+
+        # Stop TTL sweeper task
+        if self._ttl_sweeper_task and not self._ttl_sweeper_task.done():
+            logger.info("Stopping TTL sweeper task...")
+            self._ttl_stop_event.set()
+            try:
+                await asyncio.wait_for(self._ttl_sweeper_task, timeout=5.0)
+                logger.info("TTL sweeper task stopped successfully")
+            except asyncio.TimeoutError:
+                logger.warning("TTL sweeper task did not stop within timeout, cancelling...")
+                self._ttl_sweeper_task.cancel()
+                try:
+                    await self._ttl_sweeper_task
+                except asyncio.CancelledError:
+                    pass
+
+        # Close Qdrant client
+        if hasattr(self, 'qdrant_client') and self.qdrant_client:
+            logger.info("Closing Qdrant client...")
+            try:
+                await asyncio.wait_for(self.qdrant_client.close(), timeout=5.0)
+                logger.info("Qdrant client closed successfully")
+            except asyncio.TimeoutError:
+                logger.warning("Qdrant client close timed out")
+            except Exception as e:
+                logger.warning(f"Error closing Qdrant client: {e}")
+
+        # Clear caches
+        logger.info("Clearing caches...")
+        self._prepared_statements.clear()
+        self._embedding_cache.clear()
+
+        # Export final metrics if tracer is enabled
+        if self.tracer:
+            logger.info("Exporting final traces...")
+            # OpenTelemetry auto-exports on shutdown
+
+        logger.info(f"AsyncScyllaDBStore shutdown complete for keyspace '{self.keyspace}'")
+
+    async def health_check(self) -> dict[str, Any]:
+        """
+        Perform health check on all connections.
+
+        Returns:
+            Dictionary with health status for ScyllaDB and Qdrant
+
+        Example:
+            health = await store.health_check()
+            print(health)
+            # {
+            #     "scylladb": {"status": "healthy", "latency_ms": 2.5},
+            #     "qdrant": {"status": "healthy", "latency_ms": 1.2},
+            #     "overall": "healthy"
+            # }
+        """
+        health_status = {}
+
+        # Check ScyllaDB
+        try:
+            start = time.perf_counter()
+            await self._execute_async("SELECT now() FROM system.local")
+            latency_ms = (time.perf_counter() - start) * 1000
+            health_status["scylladb"] = {
+                "status": "healthy",
+                "latency_ms": round(latency_ms, 2)
+            }
+        except Exception as e:
+            health_status["scylladb"] = {
+                "status": "unhealthy",
+                "error": str(e)
+            }
+
+        # Check Qdrant
+        if hasattr(self, 'qdrant_client') and self.qdrant_client:
+            try:
+                start = time.perf_counter()
+                await self.qdrant_client.get_collections()
+                latency_ms = (time.perf_counter() - start) * 1000
+                health_status["qdrant"] = {
+                    "status": "healthy",
+                    "latency_ms": round(latency_ms, 2)
+                }
+            except Exception as e:
+                health_status["qdrant"] = {
+                    "status": "unhealthy",
+                    "error": str(e)
+                }
+
+        # Overall status
+        all_healthy = all(
+            component.get("status") == "healthy"
+            for component in health_status.values()
+        )
+        health_status["overall"] = "healthy" if all_healthy else "unhealthy"
+
+        return health_status

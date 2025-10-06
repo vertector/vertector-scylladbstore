@@ -56,6 +56,13 @@ from vertector_scylladbstore.rate_limiter import (
     rate_limit,
 )
 
+from vertector_scylladbstore.logging_utils import (
+    StructuredFormatter,
+    PerformanceLogger,
+    setup_production_logging,
+    log_with_context,
+)
+
 __version__ = "1.0.0"
 
 __all__ = [
@@ -102,4 +109,9 @@ __all__ = [
     "SlidingWindowRateLimiter",
     "RateLimitExceeded",
     "rate_limit",
+    # Logging
+    "StructuredFormatter",
+    "PerformanceLogger",
+    "setup_production_logging",
+    "log_with_context",
 ]
