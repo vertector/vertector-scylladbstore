@@ -209,6 +209,12 @@ class LRUCache:
         """Get current cache size."""
         return len(self.cache)
 
+    def clear(self) -> None:
+        """Clear all items from the cache."""
+        self.cache.clear()
+        self.hits = 0
+        self.misses = 0
+
     def get_stats(self) -> dict[str, Any]:
         """Get cache statistics for monitoring."""
         total = self.hits + self.misses
@@ -1127,7 +1133,7 @@ class AsyncScyllaDBStore(BaseStore):
             logger.error(error_msg)
             raise StoreTimeoutError(
                 error_msg,
-                operation=operation,
+                operation_type=operation,
                 timeout_seconds=self.qdrant_timeout
             )
 
