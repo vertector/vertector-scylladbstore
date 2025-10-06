@@ -1,8 +1,29 @@
+# Core dependencies
 scylla-driver==3.29.2
 langgraph
 langchain-google-genai
 hnswlib>=0.8.0
 numpy>=1.24.0
 python-dotenv
+
+# Qdrant vector database
 qdrant-client>=1.15.1
+
+# Retry and resilience
 tenacity>=9.1.2
+
+# Configuration validation
+pydantic>=2.0.0
+
+# Observability (optional but recommended)
+opentelemetry-api>=1.20.0
+opentelemetry-sdk>=1.20.0
+opentelemetry-exporter-otlp>=1.20.0
+prometheus-client>=0.17.0
+
+# Secrets management (choose one based on your cloud provider)
+boto3>=1.28.0  # For AWS Secrets Manager
+# azure-keyvault-secrets>=4.7.0  # For Azure Key Vault (uncomment if needed)
+
+# HTTP client for alerts (optional)
+aiohttp>=3.8.0

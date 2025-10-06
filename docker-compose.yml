@@ -3,16 +3,16 @@ services:
     image: scylladb/scylla:2025.3.1
     container_name: scylladb
     ports:
-      - "9042:9042"  # CQL native transport port
-      - "9160:9160"  # Thrift client API
-      - "17000:7000"  # Inter-node communication
-      - "17001:7001"  # TLS inter-node communication
-      - "19000:10000"  # REST API
+      - 9042:9042  # CQL native transport port
+      - 9160:9160  # Thrift client API
+      - 17000:7000  # Inter-node communication
+      - 17001:7001  # TLS inter-node communication
+      - 19000:10000  # REST API
     volumes:
       - scylla_data:/var/lib/scylla
     command: --smp 1 --memory 1G --overprovisioned 1
     healthcheck:
-      test: ["CMD", "cqlsh", "-e", "describe cluster"]
+      test: [CMD, cqlsh, -e, "describe cluster"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -25,12 +25,12 @@ services:
     container_name: qdrant
     restart: unless-stopped
     ports:
-      - "6333:6333"  # REST API
-      - "6334:6334"  # gRPC API (faster)
+      - 6333:6333  # REST API
+      - 6334:6334  # gRPC API (faster)
     expose:
-      - "6333"
-      - "6334"
-      - "6335"  # Internal metrics
+      - 6333
+      - 6334
+      - 6335  # Internal metrics
     volumes:
       - qdrant_data:/qdrant/storage
     environment:
@@ -38,7 +38,7 @@ services:
     networks:
       - scylla_network
     healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:6333/healthz || exit 1"]
+      test: [CMD-SHELL, wget --no-verbose --tries=1 --spider http://localhost:6333/healthz || exit 1]
       interval: 30s
       timeout: 10s
       retries: 5

@@ -36,6 +36,10 @@ from cassandra.query import SimpleStatement, BatchStatement, BatchType, Consiste
 from cassandra.concurrent import execute_concurrent_with_args
 from cassandra.io.asyncioreactor import AsyncioConnection
 
+# Import observability and rate limiting modules
+from vertector_scylladbstore.observability import Tracer, EnhancedMetrics, AlertManager, AlertSeverity
+from vertector_scylladbstore.rate_limiter import TokenBucketRateLimiter, RateLimitExceeded
+
 # Qdrant integration (optional)
 try:
     from qdrant_client import AsyncQdrantClient
@@ -542,7 +546,8 @@ class CircuitBreaker:
         self,
         failure_threshold: int = 5,
         success_threshold: int = 2,
-        timeout_seconds: float = 60.0
+        timeout_seconds: float = 60.0,
+        alert_manager: Any | None = None
     ):
         """
         Initialize circuit breaker.
@@ -551,10 +556,12 @@ class CircuitBreaker:
             failure_threshold: Number of failures before opening circuit
             success_threshold: Number of successes needed to close circuit from half-open
             timeout_seconds: Time to wait before entering half-open state
+            alert_manager: Optional AlertManager instance for critical alerts
         """
         self.failure_threshold = failure_threshold
         self.success_threshold = success_threshold
         self.timeout_seconds = timeout_seconds
+        self.alert_manager = alert_manager
 
         self._state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
         self._failure_count = 0
@@ -620,6 +627,14 @@ class CircuitBreaker:
                 elif self._state == "CLOSED" and self._failure_count >= self.failure_threshold:
                     logger.error(f"Circuit breaker opening (failure threshold {self.failure_threshold} exceeded)")
                     self._state = "OPEN"
+
+                    # Trigger critical alert for circuit breaker opening
+                    if self.alert_manager:
+                        self.alert_manager.trigger_alert(
+                            severity=AlertSeverity.CRITICAL,
+                            message=f"Circuit breaker OPEN: failure threshold {self.failure_threshold} exceeded",
+                            context={"failure_count": self._failure_count, "state": "OPEN"}
+                        )
 
             raise
 
@@ -877,6 +892,10 @@ class AsyncScyllaDBStore(BaseStore):
         execution_profiles: dict[str, ExecutionProfileConfig] | None = None,
         enable_circuit_breaker: bool = True,
         circuit_breaker_config: dict[str, Any] | None = None,
+        enable_rate_limiting: bool = False,
+        rate_limit_config: dict[str, Any] | None = None,
+        enable_tracing: bool = False,
+        enable_alerting: bool = False,
         qdrant_url: str = "http://localhost:6333",
         qdrant_collection: str | None = None,
     ) -> None:
@@ -893,6 +912,10 @@ class AsyncScyllaDBStore(BaseStore):
             execution_profiles: Optional execution profile configurations
             enable_circuit_breaker: Enable circuit breaker for resilience (default: True)
             circuit_breaker_config: Circuit breaker configuration
+            enable_rate_limiting: Enable rate limiting (default: False)
+            rate_limit_config: Rate limiter configuration (requests_per_second, burst_size)
+            enable_tracing: Enable OpenTelemetry tracing (default: False)
+            enable_alerting: Enable alert manager (default: False)
             qdrant_url: Qdrant server URL (REQUIRED, default: http://localhost:6333)
             qdrant_collection: Qdrant collection name (default: keyspace name)
         """
@@ -916,8 +939,37 @@ class AsyncScyllaDBStore(BaseStore):
         # Embedding cache for performance (LRU for better hit rate)
         self._embedding_cache = LRUCache(max_size=10000)
 
-        # Metrics tracking
-        self.metrics = QueryMetrics()
+        # Enhanced Metrics tracking with percentiles (p50, p95, p99)
+        self.metrics = EnhancedMetrics(service_name=f"scylladb_store_{keyspace}")
+        logger.info("Using EnhancedMetrics with Prometheus support and percentile tracking")
+
+        # OpenTelemetry Tracing (optional)
+        if enable_tracing:
+            self.tracer = Tracer(service_name=f"scylladb_store_{keyspace}")
+            logger.info("OpenTelemetry tracing enabled")
+        else:
+            self.tracer = None
+
+        # Alert Manager (optional)
+        if enable_alerting:
+            self.alert_manager = AlertManager()
+            logger.info("Alert manager enabled")
+        else:
+            self.alert_manager = None
+
+        # Rate Limiter (optional, disabled by default)
+        if enable_rate_limiting:
+            rl_config = rate_limit_config or {}
+            self.rate_limiter = TokenBucketRateLimiter(
+                default_requests_per_second=rl_config.get("requests_per_second", 1000),
+                default_burst_size=rl_config.get("burst_size", 100)
+            )
+            logger.info(
+                f"Rate limiting enabled: {rl_config.get('requests_per_second', 1000)} req/s, "
+                f"burst={rl_config.get('burst_size', 100)}"
+            )
+        else:
+            self.rate_limiter = None
 
         # Circuit breaker for resilience (enabled by default)
         if enable_circuit_breaker:
@@ -925,7 +977,8 @@ class AsyncScyllaDBStore(BaseStore):
             self.circuit_breaker = CircuitBreaker(
                 failure_threshold=cb_config.get("failure_threshold", 5),
                 success_threshold=cb_config.get("success_threshold", 2),
-                timeout_seconds=cb_config.get("timeout_seconds", 60.0)
+                timeout_seconds=cb_config.get("timeout_seconds", 60.0),
+                alert_manager=self.alert_manager
             )
             logger.info(
                 f"Circuit breaker enabled with defaults: "
@@ -1287,6 +1340,10 @@ class AsyncScyllaDBStore(BaseStore):
         execution_profiles: dict[str, ExecutionProfileConfig] | None = None,
         enable_circuit_breaker: bool = True,
         circuit_breaker_config: dict[str, Any] | None = None,
+        enable_rate_limiting: bool = False,
+        rate_limit_config: dict[str, Any] | None = None,
+        enable_tracing: bool = False,
+        enable_alerting: bool = False,
         qdrant_url: str = "http://localhost:6333",
         qdrant_collection: str | None = None,
     ) -> AsyncIterator["AsyncScyllaDBStore"]:
@@ -1322,70 +1379,36 @@ class AsyncScyllaDBStore(BaseStore):
         cluster_config = {
             "contact_points": contact_points,
             "connection_class": AsyncioConnection,
-
-            # Connection pool optimization
-            "protocol_version": pool_config.get("protocol_version", ConnectionPoolDefaults.PROTOCOL_VERSION),
             "port": pool_config.get("port", 9042),
-            "executor_threads": pool_config.get("executor_threads", ConnectionPoolDefaults.EXECUTOR_THREADS),
-
-            # Timeouts
-            "connect_timeout": pool_config.get("connect_timeout", ConnectionPoolDefaults.CONNECT_TIMEOUT),
-            "control_connection_timeout": pool_config.get("control_connection_timeout", ConnectionPoolDefaults.CONTROL_CONNECTION_TIMEOUT),
-            "idle_heartbeat_timeout": pool_config.get("idle_heartbeat_timeout", ConnectionPoolDefaults.IDLE_HEARTBEAT_TIMEOUT),
-            "max_schema_agreement_wait": pool_config.get("max_schema_agreement_wait", ConnectionPoolDefaults.MAX_SCHEMA_AGREEMENT_WAIT),
-
-            # Compression for network efficiency (lz4 is fastest)
-            "compression": pool_config.get("compression", True),  # Enables lz4 compression
         }
 
-        # Add optional configurations if provided
-        if "load_balancing_policy" in pool_config:
-            cluster_config["load_balancing_policy"] = pool_config["load_balancing_policy"]
-        else:
-            # Use ScyllaDB-optimized TokenAwarePolicy for shard awareness
-            # This reduces latency by routing requests directly to the right shard
-            cluster_config["load_balancing_policy"] = TokenAwarePolicy(DCAwareRoundRobinPolicy())
-            logger.info("Using TokenAwarePolicy for ScyllaDB shard-aware routing")
-
-        # Enable shard awareness for ScyllaDB (enabled by default, but make it explicit)
-        if "shard_aware_options" not in pool_config:
-            cluster_config["shard_aware_options"] = {"disable": False}
-
-        if "default_retry_policy" in pool_config:
-            cluster_config["default_retry_policy"] = pool_config["default_retry_policy"]
-
-        if "reconnection_policy" in pool_config:
-            cluster_config["reconnection_policy"] = pool_config["reconnection_policy"]
-
-        # Note: Connection pool settings (core_connections_per_host, max_connections_per_host)
-        # are not supported as Cluster() constructor parameters in recent driver versions.
-        # They should be set via the connection_class or ignored.
-        # The driver manages connection pooling automatically based on protocol version.
-
-        core_conns = pool_config.get("core_connections_per_host", ConnectionPoolDefaults.CORE_CONNECTIONS_PER_HOST)
-        max_conns = pool_config.get("max_connections_per_host", ConnectionPoolDefaults.MAX_CONNECTIONS_PER_HOST)
-
-        logger.info(
-            f"Connection pool settings (informational): core={core_conns}, max={max_conns}"
+        # Create default execution profile with ScyllaDB-optimized settings
+        # Use ScyllaDB-optimized TokenAwarePolicy for shard awareness
+        # This reduces latency by routing requests directly to the right shard
+        load_balancing_policy = pool_config.get(
+            "load_balancing_policy",
+            TokenAwarePolicy(DCAwareRoundRobinPolicy())
         )
-        logger.info("Note: Driver manages connection pooling automatically")
+
+        default_profile = ExecutionProfile(
+            load_balancing_policy=load_balancing_policy,
+            request_timeout=pool_config.get("request_timeout", 10.0),
+        )
+
+        cluster_config["execution_profiles"] = {EXEC_PROFILE_DEFAULT: default_profile}
+        logger.info("Using TokenAwarePolicy for ScyllaDB shard-aware routing via execution profile")
 
         # Create cluster with optimized configuration
         cluster = Cluster(**cluster_config)
 
-        logger.info(
-            f"Created cluster with optimized settings: "
-            f"protocol_version={cluster_config['protocol_version']}, "
-            f"executor_threads={cluster_config['executor_threads']}, "
-            f"compression={cluster_config['compression']}"
-        )
+        logger.info("Created cluster with execution profile configuration")
 
-        # Add execution profiles if configured
+        # Add custom execution profiles if configured
         if execution_profiles:
             for profile_name, profile_config in execution_profiles.items():
                 profile = ExecutionProfile(**profile_config)
                 cluster.add_execution_profile(profile_name, profile)
-                logger.info(f"Added execution profile: {profile_name}")
+                logger.info(f"Added custom execution profile: {profile_name}")
 
         store = None
         try:
@@ -1404,6 +1427,10 @@ class AsyncScyllaDBStore(BaseStore):
                 execution_profiles=execution_profiles,
                 enable_circuit_breaker=enable_circuit_breaker,
                 circuit_breaker_config=circuit_breaker_config,
+                enable_rate_limiting=enable_rate_limiting,
+                rate_limit_config=rate_limit_config,
+                enable_tracing=enable_tracing,
+                enable_alerting=enable_alerting,
                 qdrant_url=qdrant_url,
                 qdrant_collection=qdrant_collection,
             )
@@ -1580,10 +1607,23 @@ class AsyncScyllaDBStore(BaseStore):
                     )
                     await asyncio.sleep(wait_time)
                 else:
-                    logger.error(
+                    # Final attempt failed - raise error to prevent silent data inconsistency
+                    error_msg = (
                         f"Failed to sync to Qdrant after {max_retries} attempts: {e}. "
-                        f"Data consistency may be affected for point {point_id}"
+                        f"Data inconsistency detected for point {point_id}. "
+                        f"ScyllaDB write succeeded but vector sync failed."
                     )
+                    logger.error(error_msg)
+
+                    # Trigger critical alert for data inconsistency
+                    if self.alert_manager:
+                        self.alert_manager.trigger_alert(
+                            severity=AlertSeverity.CRITICAL,
+                            message="Data inconsistency: Qdrant sync failed after ScyllaDB write",
+                            context={"point_id": point_id, "error": str(e), "max_retries": max_retries}
+                        )
+
+                    raise StoreQueryError(error_msg, original_error=e)
 
     async def _batch_sync_to_qdrant(
         self,
@@ -1636,9 +1676,22 @@ class AsyncScyllaDBStore(BaseStore):
                     )
                     await asyncio.sleep(wait_time)
                 else:
-                    logger.error(
-                        f"Failed to batch sync {len(points)} points to Qdrant after {max_retries} attempts: {e}"
+                    # Final attempt failed - raise error to prevent silent data inconsistency
+                    error_msg = (
+                        f"Failed to batch sync {len(points)} points to Qdrant after {max_retries} attempts: {e}. "
+                        f"Data inconsistency detected. ScyllaDB writes succeeded but vector sync failed."
                     )
+                    logger.error(error_msg)
+
+                    # Trigger critical alert for batch data inconsistency
+                    if self.alert_manager:
+                        self.alert_manager.trigger_alert(
+                            severity=AlertSeverity.CRITICAL,
+                            message=f"Batch data inconsistency: {len(points)} Qdrant syncs failed",
+                            context={"point_count": len(points), "error": str(e), "max_retries": max_retries}
+                        )
+
+                    raise StoreQueryError(error_msg, original_error=e)
 
     def enable_circuit_breaker(
         self,
@@ -1663,7 +1716,8 @@ class AsyncScyllaDBStore(BaseStore):
         self.circuit_breaker = CircuitBreaker(
             failure_threshold=failure_threshold,
             success_threshold=success_threshold,
-            timeout_seconds=timeout_seconds
+            timeout_seconds=timeout_seconds,
+            alert_manager=self.alert_manager
         )
         logger.info(
             f"Circuit breaker enabled: failure_threshold={failure_threshold}, "
@@ -1933,6 +1987,27 @@ class AsyncScyllaDBStore(BaseStore):
             StoreTimeoutError: If operation times out
             StoreUnavailableError: If required replicas are unavailable
         """
+        # Rate limiting check
+        if self.rate_limiter:
+            if not self.rate_limiter.check("default"):
+                retry_after = self.rate_limiter.get_retry_after("default")
+                raise RateLimitExceeded("GET operation rate limit exceeded", retry_after)
+
+        # OpenTelemetry tracing
+        if self.tracer:
+            async with self.tracer.span("aget", attributes={"namespace": str(namespace), "key": key}):
+                return await self._aget_impl(namespace, key, refresh_ttl=refresh_ttl)
+        else:
+            return await self._aget_impl(namespace, key, refresh_ttl=refresh_ttl)
+
+    async def _aget_impl(
+        self,
+        namespace: tuple[str, ...],
+        key: str,
+        *,
+        refresh_ttl: bool | None = None,
+    ) -> Item | None:
+        """Internal implementation of aget."""
         # Validate inputs
         self._validate_namespace(namespace)
         self._validate_key(key)
@@ -1946,11 +2021,17 @@ class AsyncScyllaDBStore(BaseStore):
         if not result:
             return None
 
-        row = result[0]
+        row = result.one() if hasattr(result, 'one') else (result[0] if result else None)
+        if not row:
+            return None
+
+        # If value is None, the row expired (TTL reached)
+        if row.value is None:
+            return None
 
         # Refresh TTL if requested and TTL is set
         if should_refresh and row.ttl_seconds:
-            await self._refresh_ttl(prefix, key, row.ttl_seconds)
+            await self._refresh_ttl(prefix, key, row.value, row.ttl_seconds)
 
         return self._row_to_item(row, namespace, key)
 
@@ -1985,6 +2066,30 @@ class AsyncScyllaDBStore(BaseStore):
             StoreTimeoutError: If operation times out
             StoreUnavailableError: If required replicas are unavailable
         """
+        # Rate limiting check
+        if self.rate_limiter:
+            if not self.rate_limiter.check("default"):
+                retry_after = self.rate_limiter.get_retry_after("default")
+                raise RateLimitExceeded("PUT operation rate limit exceeded", retry_after)
+
+        # OpenTelemetry tracing
+        if self.tracer:
+            async with self.tracer.span("aput", attributes={"namespace": str(namespace), "key": key}):
+                return await self._aput_impl(namespace, key, value, index, ttl=ttl, wait_for_vector_sync=wait_for_vector_sync)
+        else:
+            return await self._aput_impl(namespace, key, value, index, ttl=ttl, wait_for_vector_sync=wait_for_vector_sync)
+
+    async def _aput_impl(
+        self,
+        namespace: tuple[str, ...],
+        key: str,
+        value: dict[str, Any],
+        index: Literal[False] | list[str] | None = None,
+        *,
+        ttl: float | None | type[NOT_PROVIDED] = NOT_PROVIDED,
+        wait_for_vector_sync: bool = False,
+    ) -> None:
+        """Internal implementation of aput."""
         # Validate all inputs
         self._validate_namespace(namespace)
         self._validate_key(key)
@@ -2053,6 +2158,25 @@ class AsyncScyllaDBStore(BaseStore):
             namespace: Hierarchical path
             key: Item identifier
         """
+        # Rate limiting check
+        if self.rate_limiter:
+            if not self.rate_limiter.check("default"):
+                retry_after = self.rate_limiter.get_retry_after("default")
+                raise RateLimitExceeded("DELETE operation rate limit exceeded", retry_after)
+
+        # OpenTelemetry tracing
+        if self.tracer:
+            async with self.tracer.span("adelete", attributes={"namespace": str(namespace), "key": key}):
+                return await self._adelete_impl(namespace, key)
+        else:
+            return await self._adelete_impl(namespace, key)
+
+    async def _adelete_impl(
+        self,
+        namespace: tuple[str, ...],
+        key: str,
+    ) -> None:
+        """Internal implementation of adelete."""
         self._validate_namespace(namespace)
 
         prefix = self._namespace_to_prefix(namespace)
@@ -2142,7 +2266,10 @@ class AsyncScyllaDBStore(BaseStore):
             )
 
         # Check [applied] column
-        return result[0].applied if result else False
+        if not result:
+            return False
+        row = result.one() if hasattr(result, 'one') else (result[0] if result else None)
+        return row.applied if row else False
 
     async def aupdate_if_exists(
         self,
@@ -2200,7 +2327,10 @@ class AsyncScyllaDBStore(BaseStore):
                 (value_json, now, prefix, key)
             )
 
-        return result[0].applied if result else False
+        if not result:
+            return False
+        row = result.one() if hasattr(result, 'one') else (result[0] if result else None)
+        return row.applied if row else False
 
     async def acompare_and_set(
         self,
@@ -2272,7 +2402,10 @@ class AsyncScyllaDBStore(BaseStore):
                 (new_json, now, prefix, key, expected_json)
             )
 
-        return result[0].applied if result else False
+        if not result:
+            return False
+        row = result.one() if hasattr(result, 'one') else (result[0] if result else None)
+        return row.applied if row else False
 
     async def adelete_if_exists(
         self,
@@ -2298,7 +2431,10 @@ class AsyncScyllaDBStore(BaseStore):
         prefix = self._namespace_to_prefix(namespace)
         result = await self._execute_prepared("delete_if_exists", (prefix, key))
 
-        return result[0].applied if result else False
+        if not result:
+            return False
+        row = result.one() if hasattr(result, 'one') else (result[0] if result else None)
+        return row.applied if row else False
 
     async def adelete_if_value(
         self,
@@ -2342,7 +2478,10 @@ class AsyncScyllaDBStore(BaseStore):
             (prefix, key, expected_json)
         )
 
-        return result[0].applied if result else False
+        if not result:
+            return False
+        row = result.one() if hasattr(result, 'one') else (result[0] if result else None)
+        return row.applied if row else False
 
     async def asearch(
         self,
@@ -2379,6 +2518,42 @@ class AsyncScyllaDBStore(BaseStore):
             - Without query: Returns results sorted by recency
             - Filters are always applied regardless of search mode
         """
+        # Rate limiting check
+        if self.rate_limiter:
+            if not self.rate_limiter.check("default"):
+                retry_after = self.rate_limiter.get_retry_after("default")
+                raise RateLimitExceeded("SEARCH operation rate limit exceeded", retry_after)
+
+        # OpenTelemetry tracing
+        if self.tracer:
+            async with self.tracer.span(
+                "asearch",
+                attributes={
+                    "namespace_prefix": str(namespace_prefix),
+                    "query": query or "",
+                    "limit": limit,
+                    "offset": offset,
+                }
+            ):
+                return await self._asearch_impl(
+                    namespace_prefix, query, filter, limit, offset, refresh_ttl, fetch_size
+                )
+        else:
+            return await self._asearch_impl(
+                namespace_prefix, query, filter, limit, offset, refresh_ttl, fetch_size
+            )
+
+    async def _asearch_impl(
+        self,
+        namespace_prefix: tuple[str, ...],
+        query: str | None = None,
+        filter: dict[str, Any] | None = None,
+        limit: int = 10,
+        offset: int = 0,
+        refresh_ttl: bool | None = None,
+        fetch_size: int | None = None,
+    ) -> list[SearchItem]:
+        """Internal implementation of asearch."""
         self._validate_namespace(namespace_prefix)
 
         # If query provided and semantic search enabled, use semantic search
@@ -2435,7 +2610,7 @@ class AsyncScyllaDBStore(BaseStore):
 
             # Collect TTL refresh operations instead of executing immediately
             if should_refresh and row.ttl_seconds:
-                ttl_refresh_items.append((row.prefix, row.key, row.ttl_seconds))
+                ttl_refresh_items.append((row.prefix, row.key, row.value, row.ttl_seconds))
 
             score = self._calculate_relevance_score(
                 value=value,
@@ -2525,9 +2700,9 @@ class AsyncScyllaDBStore(BaseStore):
         # Fetch extra to account for namespace filtering and offset
         fetch_limit = min((limit + offset) * 2 + 20, 1000)
 
-        search_results = await self.qdrant_client.search(
+        search_results = await self.qdrant_client.query_points(
             collection_name=self.qdrant_collection,
-            query_vector=query_embedding,
+            query=query_embedding,
             limit=fetch_limit,
             with_payload=True,
         )
@@ -2537,7 +2712,10 @@ class AsyncScyllaDBStore(BaseStore):
         keys_to_fetch = []
         result_map = {}  # Map (namespace, key) -> (score, result)
 
-        for result in search_results:
+        # Handle query_points response (returns points attribute)
+        points = search_results.points if hasattr(search_results, 'points') else search_results
+
+        for result in points:
             payload = result.payload
             scylla_id = payload.get("scylla_id", "")
 
@@ -2555,7 +2733,8 @@ class AsyncScyllaDBStore(BaseStore):
             result_map[key_tuple] = (float(result.score), result)
 
         if not keys_to_fetch:
-            logger.debug(f"No keys to fetch after Qdrant search (searched {len(search_results)} results)")
+            num_results = len(points) if points else 0
+            logger.debug(f"No keys to fetch after Qdrant search (searched {num_results} results)")
             return []
 
         logger.debug(f"Batch fetching {len(keys_to_fetch)} items from ScyllaDB")
@@ -2828,7 +3007,7 @@ class AsyncScyllaDBStore(BaseStore):
                 # Record metrics
                 latency_ms = (time.perf_counter() - start_time) * 1000
                 metric_type = f"atomic_{batch_type.lower()}"
-                await self.metrics.record_batch(
+                self.metrics.record_batch(
                     batch_size=len(ops_list),
                     batch_type=metric_type,
                     latency_ms=latency_ms,
@@ -2840,7 +3019,7 @@ class AsyncScyllaDBStore(BaseStore):
                 # Record failure
                 latency_ms = (time.perf_counter() - start_time) * 1000
                 metric_type = f"atomic_{batch_type.lower()}"
-                await self.metrics.record_batch(
+                self.metrics.record_batch(
                     batch_size=len(ops_list),
                     batch_type=metric_type,
                     latency_ms=latency_ms,
@@ -2875,7 +3054,7 @@ class AsyncScyllaDBStore(BaseStore):
 
             # Record metrics for concurrent batch
             latency_ms = (time.perf_counter() - start_time) * 1000
-            await self.metrics.record_batch(
+            self.metrics.record_batch(
                 batch_size=len(ops_list),
                 batch_type="concurrent",
                 latency_ms=latency_ms,
@@ -2884,7 +3063,7 @@ class AsyncScyllaDBStore(BaseStore):
         except Exception as e:
             # Record failure
             latency_ms = (time.perf_counter() - start_time) * 1000
-            await self.metrics.record_batch(
+            self.metrics.record_batch(
                 batch_size=len(ops_list),
                 batch_type="concurrent",
                 latency_ms=latency_ms,
@@ -2984,7 +3163,7 @@ class AsyncScyllaDBStore(BaseStore):
             print(f"Error rate: {metrics['error_rate']*100:.2f}%")
             ```
         """
-        return await self.metrics.get_stats()
+        return self.metrics.get_stats()
 
     async def reset_metrics(self):
         """
@@ -2992,7 +3171,7 @@ class AsyncScyllaDBStore(BaseStore):
 
         Useful for starting fresh measurements or after deployment.
         """
-        await self.metrics.reset()
+        self.metrics.reset()
         logger.info("Performance metrics reset")
 
     async def health_check(self) -> dict[str, Any]:
@@ -3059,7 +3238,7 @@ class AsyncScyllaDBStore(BaseStore):
                     overall_status = "degraded"
 
             # Check 4: Get current metrics
-            metrics = await self.metrics.get_stats()
+            metrics = self.metrics.get_stats()
             checks["metrics"] = {
                 "status": "healthy" if metrics["error_rate"] < 0.05 else "degraded",
                 "error_rate": metrics["error_rate"],
@@ -3109,7 +3288,7 @@ class AsyncScyllaDBStore(BaseStore):
             app.router.add_get('/metrics', metrics_handler)
             ```
         """
-        metrics = await self.metrics.get_stats()
+        metrics = self.metrics.get_stats()
 
         # Build Prometheus metrics
         lines = []
@@ -3374,13 +3553,22 @@ class AsyncScyllaDBStore(BaseStore):
 
             # Record successful query
             latency_ms = (time.perf_counter() - start_time) * 1000
-            await self.metrics.record_query(statement_name, latency_ms, success=True)
+            self.metrics.record_query(statement_name, latency_ms, success=True)
 
             return list(result) if result else []
 
         except NoHostAvailable as e:
             latency_ms = (time.perf_counter() - start_time) * 1000
-            await self.metrics.record_query(statement_name, latency_ms, success=False, error_type="NoHostAvailable")
+            self.metrics.record_query(statement_name, latency_ms, success=False, error_type="NoHostAvailable")
+
+            # Trigger critical alert for cluster unavailability
+            if self.alert_manager:
+                self.alert_manager.trigger_alert(
+                    severity=AlertSeverity.CRITICAL,
+                    message="ScyllaDB cluster unreachable: No hosts available",
+                    context={"error": str(e), "latency_ms": latency_ms}
+                )
+
             raise StoreConnectionError(
                 "No hosts available for query execution",
                 original_error=e
@@ -3389,7 +3577,7 @@ class AsyncScyllaDBStore(BaseStore):
         except (ReadTimeout, WriteTimeout) as e:
             latency_ms = (time.perf_counter() - start_time) * 1000
             operation = "read" if isinstance(e, ReadTimeout) else "write"
-            await self.metrics.record_query(statement_name, latency_ms, success=False, error_type=f"{operation}Timeout")
+            self.metrics.record_query(statement_name, latency_ms, success=False, error_type=f"{operation}Timeout")
             raise StoreTimeoutError(
                 f"{operation.capitalize()} operation timed out",
                 original_error=e,
@@ -3398,7 +3586,7 @@ class AsyncScyllaDBStore(BaseStore):
 
         except OperationTimedOut as e:
             latency_ms = (time.perf_counter() - start_time) * 1000
-            await self.metrics.record_query(statement_name, latency_ms, success=False, error_type="OperationTimedOut")
+            self.metrics.record_query(statement_name, latency_ms, success=False, error_type="OperationTimedOut")
             raise StoreTimeoutError(
                 "Client-side operation timeout",
                 original_error=e
@@ -3406,7 +3594,7 @@ class AsyncScyllaDBStore(BaseStore):
 
         except Unavailable as e:
             latency_ms = (time.perf_counter() - start_time) * 1000
-            await self.metrics.record_query(statement_name, latency_ms, success=False, error_type="Unavailable")
+            self.metrics.record_query(statement_name, latency_ms, success=False, error_type="Unavailable")
 
             # Extract details from exception if available
             consistency = getattr(e, 'consistency', None)
@@ -3429,7 +3617,7 @@ class AsyncScyllaDBStore(BaseStore):
             elif isinstance(e, WriteFailure):
                 operation = "write"
 
-            await self.metrics.record_query(statement_name, latency_ms, success=False, error_type=f"{operation}Failure")
+            self.metrics.record_query(statement_name, latency_ms, success=False, error_type=f"{operation}Failure")
 
             raise StoreQueryError(
                 f"Coordination failure during {operation} operation",
@@ -3438,7 +3626,7 @@ class AsyncScyllaDBStore(BaseStore):
 
         except (Unauthorized, AuthenticationFailed) as e:
             latency_ms = (time.perf_counter() - start_time) * 1000
-            await self.metrics.record_query(statement_name, latency_ms, success=False, error_type="AuthError")
+            self.metrics.record_query(statement_name, latency_ms, success=False, error_type="AuthError")
             raise StoreAuthenticationError(
                 "Authentication or authorization failed",
                 original_error=e
@@ -3446,7 +3634,7 @@ class AsyncScyllaDBStore(BaseStore):
 
         except (InvalidRequest, ConfigurationException) as e:
             latency_ms = (time.perf_counter() - start_time) * 1000
-            await self.metrics.record_query(statement_name, latency_ms, success=False, error_type="ValidationError")
+            self.metrics.record_query(statement_name, latency_ms, success=False, error_type="ValidationError")
             raise StoreValidationError(
                 f"Invalid query or configuration: {e}",
                 original_error=e
@@ -3456,13 +3644,13 @@ class AsyncScyllaDBStore(BaseStore):
             # This is actually not an error for our use case (using IF NOT EXISTS)
             # But handle it gracefully
             latency_ms = (time.perf_counter() - start_time) * 1000
-            await self.metrics.record_query(statement_name, latency_ms, success=True)
+            self.metrics.record_query(statement_name, latency_ms, success=True)
             logger.debug(f"AlreadyExists exception (expected): {e}")
             return []
 
         except RequestExecutionException as e:
             latency_ms = (time.perf_counter() - start_time) * 1000
-            await self.metrics.record_query(statement_name, latency_ms, success=False, error_type="RequestExecution")
+            self.metrics.record_query(statement_name, latency_ms, success=False, error_type="RequestExecution")
             raise StoreQueryError(
                 f"Query execution failed: {e}",
                 original_error=e
@@ -3470,7 +3658,7 @@ class AsyncScyllaDBStore(BaseStore):
 
         except DriverException as e:
             latency_ms = (time.perf_counter() - start_time) * 1000
-            await self.metrics.record_query(statement_name, latency_ms, success=False, error_type="DriverError")
+            self.metrics.record_query(statement_name, latency_ms, success=False, error_type="DriverError")
             raise ScyllaDBStoreError(
                 f"Driver error: {e}",
                 original_error=e
@@ -3478,7 +3666,7 @@ class AsyncScyllaDBStore(BaseStore):
 
         except Exception as e:
             latency_ms = (time.perf_counter() - start_time) * 1000
-            await self.metrics.record_query(statement_name, latency_ms, success=False, error_type="UnexpectedError")
+            self.metrics.record_query(statement_name, latency_ms, success=False, error_type="UnexpectedError")
             logger.error(f"Unexpected error in _execute_prepared: {e}", exc_info=e)
             raise ScyllaDBStoreError(
                 f"Unexpected error: {e}",
@@ -3509,7 +3697,7 @@ class AsyncScyllaDBStore(BaseStore):
             "delete": "DELETE FROM store WHERE prefix = ? AND key = ?",
             "refresh_ttl": """
                 UPDATE store USING TTL ?
-                SET updated_at = ?
+                SET value = ?, updated_at = ?
                 WHERE prefix = ? AND key = ?
             """,
         }
@@ -3958,14 +4146,14 @@ class AsyncScyllaDBStore(BaseStore):
         # Ensure score is within [0.0, 1.0]
         return min(1.0, max(0.0, score))
 
-    async def _refresh_ttl(self, prefix: str, key: str, ttl_seconds: int) -> None:
+    async def _refresh_ttl(self, prefix: str, key: str, value: str, ttl_seconds: int) -> None:
         """Refresh TTL for an item (ttl_seconds is already in seconds)."""
         now = datetime.now(timezone.utc)
-        await self._execute_prepared("refresh_ttl", (ttl_seconds, now, prefix, key))
+        await self._execute_prepared("refresh_ttl", (ttl_seconds, value, now, prefix, key))
 
     async def _batch_refresh_ttls(
         self,
-        items: list[tuple[str, str, int]]  # [(prefix, key, ttl_seconds), ...]
+        items: list[tuple[str, str, str, int]]  # [(prefix, key, value, ttl_seconds), ...]
     ) -> None:
         """
         Batch refresh TTLs using concurrent execution.
@@ -3982,7 +4170,7 @@ class AsyncScyllaDBStore(BaseStore):
             return
 
         now = datetime.now(timezone.utc)
-        params_list = [(ttl, now, prefix, key) for prefix, key, ttl in items]
+        params_list = [(ttl, value, now, prefix, key) for prefix, key, value, ttl in items]
 
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
@@ -4032,7 +4220,9 @@ class AsyncScyllaDBStore(BaseStore):
         items = []
         for (ns, key), (success, result) in zip(keys_to_fetch, results):
             if success and result:
-                row = result[0]
+                row = result.one() if hasattr(result, 'one') else (result[0] if result else None)
+                if not row:
+                    continue
                 items.append(Item(
                     value=json.loads(row.value),
                     key=row.key,
@@ -4082,7 +4272,11 @@ class AsyncScyllaDBStore(BaseStore):
         # Process results
         for (idx, op), (success, result) in zip(index_map, execute_results):
             if success and result:
-                row = result[0]
+                row = result.one() if hasattr(result, 'one') else (result[0] if result else None)
+                if not row:
+                    results[idx] = None
+                    continue
+
                 should_refresh = op.refresh_ttl if op.refresh_ttl is not None else self.ttl_config.get("refresh_on_read", True)
 
                 # Refresh TTL if needed
