@@ -6,7 +6,7 @@ Thank you for your interest in contributing to Vertector ScyllaDB Store! This do
 
 ### Prerequisites
 
-- Python 3.12 or 3.13
+- Python 3.12, 3.13, or 3.14
 - Docker and Docker Compose (for local development)
 - Git
 
@@ -149,11 +149,12 @@ class TestFeatureName:
         assert result == expected_value
 ```
 
-### Coverage Requirements
+### Test Stats
 
-- **Minimum coverage**: 50% overall
-- **New code**: Aim for 80%+ coverage
-- **Critical paths**: 100% coverage required
+- **Current tests**: 173 tests passing
+- **Test files**: 11 test modules
+- **New code**: Aim for comprehensive test coverage
+- **Critical paths**: Full coverage required
 
 ### Running Tests
 
@@ -221,9 +222,9 @@ async def aput(
 Before submitting a PR, ensure:
 
 - [ ] All tests pass (`pytest`)
-- [ ] Coverage hasn't decreased significantly
 - [ ] Code is formatted (`black`, `isort`)
-- [ ] Type hints are added (`mypy` passes)
+- [ ] Linting passes (`ruff check src/ tests/`)
+- [ ] Type hints are added (`mypy src/` passes)
 - [ ] Documentation is updated
 - [ ] CHANGELOG.md is updated
 - [ ] Commit messages follow conventions
@@ -231,9 +232,10 @@ Before submitting a PR, ensure:
 ### PR Review Process
 
 1. **Automated Checks**
-   - CI/CD pipeline runs tests
-   - Coverage report generated
-   - Linting and type checking
+   - CI/CD pipeline runs tests on Python 3.12, 3.13, 3.14
+   - Linting with ruff
+   - Type checking with mypy
+   - Security scanning with safety and bandit
 
 2. **Code Review**
    - At least one team member approval required
@@ -250,12 +252,12 @@ Before submitting a PR, ensure:
 
 Before submitting performance improvements:
 
-```python
-# Run performance tests
-pytest tests/test_performance.py -v
+```bash
+# Run performance benchmarks
+python scripts/performance_benchmark.py
 
 # Profile specific operations
-python -m cProfile -o profile.stats scripts/benchmark.py
+python scripts/performance_profiler.py
 ```
 
 ### Performance Standards
@@ -306,16 +308,15 @@ We follow [Semantic Versioning](https://semver.org/):
    git tag -a v1.1.0 -m "Release v1.1.0"
    git push origin v1.1.0
    ```
-5. **GitHub Actions** automatically:
-   - Runs tests
-   - Builds package
-   - Publishes to PyPI
-   - Creates GitHub release
+5. **GitHub Release** workflow:
+   - Tag triggers release workflow
+   - Builds Python package (wheel and sdist)
+   - Can publish to PyPI (if configured)
+   - Creates GitHub release with artifacts
 
 ## Getting Help
 
-- **Documentation**: See README.md and docs/
-- **Slack**: #vertector-scylladb-store
+- **Documentation**: See README.md, PRODUCTION_READINESS.md, and CHANGELOG.md
 - **Email**: dev-team@vertector.com
 - **Issues**: https://github.com/vertector/vertector-scylladbstore/issues
 
