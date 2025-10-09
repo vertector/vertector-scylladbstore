@@ -6,7 +6,6 @@ Production-ready ScyllaDB + Qdrant store with vector search capabilities. Built 
 [![PyPI version](https://img.shields.io/pypi/v/vertector-scylladbstore.svg)](https://pypi.org/project/vertector-scylladbstore/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Tests](https://img.shields.io/badge/tests-173%2F173%20passing-brightgreen.svg)](https://github.com/vertector/vertector-scylladbstore)
-[![Coverage](https://img.shields.io/badge/coverage-57%25-yellow.svg)](https://github.com/vertector/vertector-scylladbstore)
 [![Production Ready](https://img.shields.io/badge/production-ready-brightgreen.svg)](https://github.com/vertector/vertector-scylladbstore)
 
 ## Features
@@ -25,7 +24,7 @@ Production-ready ScyllaDB + Qdrant store with vector search capabilities. Built 
 - 🛡️ **Resilience** - Circuit breaker, exponential backoff, configurable retries
 - ⚡ **Performance** - LRU caching, batch embeddings, parallel processing (66-70 docs/sec)
 - 🚦 **Rate Limiting** - Token bucket and sliding window algorithms
-- ✅ **Testing** - Comprehensive test suite (173/173 tests passing, 57% coverage)
+- ✅ **Testing** - Comprehensive test suite (173/173 tests passing)
 
 ## Quick Start
 
@@ -154,35 +153,92 @@ async with AsyncScyllaDBStore.from_config(config) as store:
 
 ## Architecture
 
+### Package Structure
+
+```
+vertector_scylladbstore/
+├── store.py              # Core AsyncScyllaDBStore implementation
+│   ├── AsyncScyllaDBStore   # Main store class (BaseStore)
+│   ├── CircuitBreaker       # Resilience pattern
+│   ├── LRUCache            # Embedding cache
+│   └── QueryMetrics        # Performance tracking
+│
+├── config.py             # Pydantic configuration models
+│   ├── ScyllaDBStoreConfig # Main config
+│   ├── AuthConfig          # Authentication settings
+│   ├── TLSConfig           # TLS/SSL settings
+│   ├── RetryConfig         # Retry policies
+│   ├── CircuitBreakerConfig
+│   ├── RateLimitConfig
+│   └── SecretsManager      # Secrets resolution
+│
+├── rate_limiter.py       # Rate limiting algorithms
+│   ├── TokenBucketRateLimiter
+│   ├── SlidingWindowRateLimiter
+│   └── CompositeRateLimiter
+│
+├── observability.py      # Tracing and metrics
+│   ├── Tracer             # OpenTelemetry tracing
+│   ├── EnhancedMetrics    # Prometheus metrics
+│   ├── PercentileTracker  # Latency percentiles
+│   └── AlertManager       # Alert integration
+│
+└── logging_utils.py      # Structured logging
+    ├── StructuredFormatter
+    ├── PerformanceLogger
+    └── setup_production_logging()
+```
+
+### System Architecture
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      Application Layer                       │
-│                    (LangGraph / Your App)                    │
-└────────────────────────┬────────────────────────────────────┘
+│                   Application Layer                          │
+│                (LangGraph / Your App)                        │
+└────────────────────────┬─────────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                   AsyncScyllaDBStore                         │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
-│  │ Rate Limiter │  │   Observ.    │  │ Circuit      │      │
-│  │              │  │   (Tracing)  │  │ Breaker      │      │
-│  └──────────────┘  └──────────────┘  └──────────────┘      │
-└───────────┬──────────────────────────────────┬──────────────┘
-            │                                  │
-            ▼                                  ▼
-┌───────────────────────┐          ┌──────────────────────┐
-│     ScyllaDB          │          │      Qdrant          │
-│   (Document Store)    │          │  (Vector Search)     │
-│                       │          │                      │
-│  ┌──────────────┐    │          │  ┌──────────────┐   │
-│  │ Keyspace:    │    │          │  │ Collection   │   │
-│  │ - Namespace  │    │          │  │ - Embeddings │   │
-│  │ - Key        │    │          │  │ - Metadata   │   │
-│  │ - Value      │    │          │  └──────────────┘   │
-│  │ - Timestamps │    │          │                      │
-│  └──────────────┘    │          └──────────────────────┘
-└───────────────────────┘
+│              AsyncScyllaDBStore (store.py)                   │
+│                                                              │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌──────────────┐│
+│  │ Rate Limiter    │  │  Observability  │  │   Circuit    ││
+│  │ (rate_limiter)  │  │  (tracing/      │  │   Breaker    ││
+│  │                 │  │   metrics)      │  │              ││
+│  └─────────────────┘  └─────────────────┘  └──────────────┘│
+│                                                              │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌──────────────┐│
+│  │ Config Manager  │  │  LRU Cache      │  │  Structured  ││
+│  │ (config.py)     │  │  (embeddings)   │  │  Logging     ││
+│  └─────────────────┘  └─────────────────┘  └──────────────┘│
+└─────────┬───────────────────────────────────────┬───────────┘
+          │                                       │
+          ▼                                       ▼
+┌──────────────────────┐              ┌──────────────────────┐
+│     ScyllaDB         │              │      Qdrant          │
+│  (Document Store)    │              │  (Vector Search)     │
+│                      │              │                      │
+│  ┌────────────────┐  │              │  ┌────────────────┐ │
+│  │ Table Schema:  │  │              │  │ Collection:    │ │
+│  │ - namespace    │  │              │  │ - vector       │ │
+│  │ - key          │  │              │  │ - payload      │ │
+│  │ - value (JSON) │  │              │  │ - metadata     │ │
+│  │ - created_at   │  │              │  └────────────────┘ │
+│  │ - updated_at   │  │              │                      │
+│  │ - ttl          │  │              └──────────────────────┘
+│  └────────────────┘  │
+└──────────────────────┘
 ```
+
+### Key Components
+
+- **AsyncScyllaDBStore**: Core async store implementing LangChain BaseStore interface
+- **Configuration**: Pydantic v2 models with environment variable support and secrets resolution
+- **Rate Limiting**: Token bucket and sliding window algorithms with composite support
+- **Observability**: OpenTelemetry distributed tracing and Prometheus metrics with percentile tracking
+- **Resilience**: Circuit breaker pattern with exponential backoff and configurable retries
+- **Caching**: LRU cache for embeddings to reduce redundant API calls
+- **Logging**: Structured JSON logging with request IDs and performance tracking
 
 ## Performance
 
@@ -238,21 +294,7 @@ pytest -m unit
 # Run integration tests (requires ScyllaDB/Qdrant)
 pytest -m integration
 
-# Run with coverage
-pytest --cov=src --cov-report=html
 ```
-
-### Test Coverage
-
-Current coverage: **57%**
-
-- ✅ Connection lifecycle
-- ✅ CRUD operations
-- ✅ Search operations (filter + semantic)
-- ✅ Batch operations
-- ✅ Error handling and retries
-- ✅ Circuit breaker behavior
-- ✅ Configuration validation
 
 ## Deployment
 
@@ -261,7 +303,7 @@ Current coverage: **57%**
 - [ ] **Security**: TLS enabled, authentication configured, secrets in vault
 - [ ] **Monitoring**: Prometheus + Grafana dashboards, alerts configured
 - [ ] **Backups**: Automated daily snapshots to S3
-- [ ] **Testing**: >80% code coverage, load tests passing
+- [ ] **Testing**: Load tests passing, performance benchmarks validated
 - [ ] **Documentation**: Runbooks, troubleshooting guides, architecture docs
 - [ ] **Scaling**: Auto-scaling configured, resource limits set
 - [ ] **Disaster Recovery**: Multi-region setup, tested failover
