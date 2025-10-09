@@ -53,6 +53,8 @@ dependencies = [
     "opentelemetry-sdk>=1.20.0",
     "opentelemetry-instrumentation>=0.41b0",
     "prometheus-client>=0.18.0",
+    "langgraph>=0.6.8",
+    "langchain-core>=0.3.78",
 ]
 
 [project.urls]
@@ -67,10 +69,7 @@ dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.1.0",
-]
-langgraph = [
-    "langgraph",
-    "langchain-google-genai",
+    "langchain-google-genai>=2.1.12",
 ]
 
 [tool.setuptools]
