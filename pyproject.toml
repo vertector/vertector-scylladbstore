@@ -7,7 +7,7 @@ name = "vertector-scylladbstore"
 version = "1.0.0"
 description = "Production-ready ScyllaDB store with vector search capabilities via Qdrant"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = {text = "MIT"}
 authors = [
     {name = "Vertector Team", email = "support@vertector.com"}
@@ -36,7 +36,6 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
