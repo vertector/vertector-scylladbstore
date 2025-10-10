@@ -41,36 +41,112 @@ pip install vertector-scylladbstore[langgraph]
 pip install vertector-scylladbstore[dev]
 ```
 
-### Basic Usage
+### Initialization Options
+
+There are four ways to initialize the store, each suited for different use cases:
+
+#### Option 1: Context Manager (Recommended for Scripts)
+
+Best for: Scripts, notebooks, one-off tasks, and automatic cleanup.
 
 ```python
 from vertector_scylladbstore import AsyncScyllaDBStore
 
-# Initialize store
+# Automatic setup and cleanup
 async with AsyncScyllaDBStore.from_contact_points(
     contact_points=["localhost"],
     keyspace="my_app",
     qdrant_url="http://localhost:6333"
 ) as store:
-    # Store a document
+    # Store is automatically set up
     await store.aput(
         namespace=("users", "user_123"),
         key="profile",
         value={"name": "Alice", "email": "alice@example.com"}
     )
 
-    # Retrieve a document
-    item = await store.aget(
-        namespace=("users", "user_123"),
-        key="profile"
-    )
-    print(item.value)  # {"name": "Alice", ...}
+    item = await store.aget(("users", "user_123"), "profile")
+    print(item.value)
+    # Automatic cleanup on exit (cluster shutdown, cache cleared)
+```
 
-    # Search documents
-    results = await store.asearch(
-        namespace_prefix=("users",),
-        limit=10
-    )
+#### Option 2: Direct Creation (Recommended for LangGraph/Web Apps)
+
+Best for: Long-lived applications, web servers, LangGraph integration.
+
+```python
+# Create store without context manager
+store = await AsyncScyllaDBStore.create(
+    contact_points=["localhost"],
+    keyspace="my_app",
+    qdrant_url="http://localhost:6333"
+)
+await store.setup()
+
+# Use in LangGraph
+from langgraph.graph import StateGraph
+graph = StateGraph(state_schema)
+# ... define graph nodes ...
+app = graph.compile(store=store)  # Pass store directly
+
+# Store persists for application lifetime
+# Optional cleanup on shutdown (clears caches, closes connections)
+await store.aclose()
+```
+
+**Note:** `aclose()` is optional but recommended for clean shutdown. It:
+- Clears embedding cache (resets `store.get_embedding_cache_stats()`)
+- Closes Qdrant client connection
+- Stops background tasks (TTL sweeper)
+- Shuts down Cassandra cluster
+- Without it, resources are cleaned up on process exit
+
+#### Option 3: Context Manager without `async with` (Alternative)
+
+Best for: When you need manual control but want context manager benefits.
+
+```python
+# Get context manager
+store_cm = AsyncScyllaDBStore.from_contact_points(
+    contact_points=["localhost"],
+    keyspace="my_app",
+    qdrant_url="http://localhost:6333"
+)
+
+# Extract store instance (calls setup automatically)
+store = await store_cm.__aenter__()
+
+# Use store...
+await store.aput(...)
+
+# Manual cleanup when done
+await store_cm.__aexit__(None, None, None)
+```
+
+#### Option 4: Manual Construction (Advanced)
+
+Best for: Custom session management, testing, advanced use cases.
+
+```python
+from cassandra.cluster import Cluster
+
+# Create session manually
+cluster = Cluster(["localhost"])
+session = cluster.connect()
+
+# Pass existing session
+store = AsyncScyllaDBStore(
+    session=session,
+    keyspace="my_app",
+    qdrant_url="http://localhost:6333"
+)
+await store.setup()
+
+# Use store...
+
+# Manual cleanup (session is caller's responsibility)
+await store.aclose()  # Does NOT shutdown cluster
+cluster.shutdown()
 ```
 
 ### With Embeddings (Semantic Search)

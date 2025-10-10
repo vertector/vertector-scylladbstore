@@ -1367,6 +1367,140 @@ class AsyncScyllaDBStore(BaseStore):
         return embeddings_result
 
     @classmethod
+    async def create(
+        cls,
+        contact_points: list[str],
+        keyspace: str,
+        *,
+        pool_config: PoolConfig | None = None,
+        index: IndexConfig | None = None,
+        sai_index: ScyllaIndexConfig | None = None,
+        ttl: TTLConfig | None = None,
+        execution_profiles: dict[str, ExecutionProfileConfig] | None = None,
+        enable_circuit_breaker: bool = True,
+        circuit_breaker_config: dict[str, Any] | None = None,
+        enable_rate_limiting: bool = False,
+        rate_limit_config: dict[str, Any] | None = None,
+        enable_tracing: bool = False,
+        enable_alerting: bool = False,
+        qdrant_url: str = "http://localhost:6333",
+        qdrant_collection: str | None = None,
+    ) -> "AsyncScyllaDBStore":
+        """
+        Create AsyncScyllaDBStore from contact points (without context manager).
+
+        Use this for long-lived applications (web servers, LangGraph apps) where the
+        store persists for the application lifetime.
+
+        Args:
+            contact_points: List of ScyllaDB node addresses
+            keyspace: Keyspace name
+            pool_config: Optional connection pool configuration
+            index: Index configuration (for semantic search)
+            sai_index: ScyllaDB SAI index configuration
+            ttl: Optional TTL configuration
+            execution_profiles: Optional execution profile configurations
+            enable_circuit_breaker: Enable circuit breaker (default: True)
+            circuit_breaker_config: Circuit breaker configuration
+            enable_rate_limiting: Enable rate limiting (default: False)
+            rate_limit_config: Rate limiting configuration
+            enable_tracing: Enable OpenTelemetry tracing (default: False)
+            enable_alerting: Enable alerting (default: False)
+            qdrant_url: Qdrant server URL (default: http://localhost:6333)
+            qdrant_collection: Qdrant collection name (default: keyspace)
+
+        Returns:
+            AsyncScyllaDBStore instance (NOT setup yet - call await store.setup())
+
+        Example (LangGraph integration):
+            # Create and setup store
+            store = await AsyncScyllaDBStore.create(
+                contact_points=["127.0.0.1"],
+                keyspace="my_store",
+                index={"dims": 768, "embed": embeddings}
+            )
+            await store.setup()
+
+            # Use with LangGraph
+            app = graph.compile(store=store)
+
+            # Optional: Cleanup on application shutdown
+            # (Recommended but not required - resources freed on process exit)
+            await store.aclose()  # Clears caches, closes connections
+
+        Cleanup with aclose():
+            Calling `await store.aclose()` is optional but recommended for:
+            - Clearing embedding cache (resets cache statistics)
+            - Closing Qdrant client connection
+            - Stopping background tasks (TTL sweeper)
+            - Shutting down Cassandra cluster gracefully
+
+            Without aclose(), resources are cleaned up when the process exits.
+
+        Note:
+            For automatic cleanup in scripts/notebooks, use `from_contact_points()`
+            with `async with` instead.
+        """
+        pool_config = pool_config or {}
+
+        # Apply best practice defaults
+        cluster_config = {
+            "contact_points": contact_points,
+            "connection_class": AsyncioConnection,
+            "port": pool_config.get("port", 9042),
+        }
+
+        # Create execution profile with ScyllaDB-optimized settings
+        load_balancing_policy = pool_config.get(
+            "load_balancing_policy",
+            TokenAwarePolicy(DCAwareRoundRobinPolicy())
+        )
+
+        default_profile = ExecutionProfile(
+            load_balancing_policy=load_balancing_policy,
+            request_timeout=pool_config.get("request_timeout", 10.0),
+        )
+
+        cluster_config["execution_profiles"] = {EXEC_PROFILE_DEFAULT: default_profile}
+
+        # Create cluster
+        cluster = Cluster(**cluster_config)
+
+        # Add custom execution profiles if configured
+        if execution_profiles:
+            for profile_name, profile_config in execution_profiles.items():
+                profile = ExecutionProfile(**profile_config)
+                cluster.add_execution_profile(profile_name, profile)
+
+        # Connect to cluster
+        session = await asyncio.get_running_loop().run_in_executor(
+            None, cluster.connect
+        )
+
+        # Create store instance
+        store = cls(
+            session=session,
+            keyspace=keyspace,
+            index=index,
+            sai_index=sai_index,
+            ttl=ttl,
+            execution_profiles=execution_profiles,
+            enable_circuit_breaker=enable_circuit_breaker,
+            circuit_breaker_config=circuit_breaker_config,
+            enable_rate_limiting=enable_rate_limiting,
+            rate_limit_config=rate_limit_config,
+            enable_tracing=enable_tracing,
+            enable_alerting=enable_alerting,
+            qdrant_url=qdrant_url,
+            qdrant_collection=qdrant_collection,
+        )
+
+        # Store cluster reference for cleanup
+        store._cluster = cluster
+
+        return store
+
+    @classmethod
     @asynccontextmanager
     async def from_contact_points(
         cls,
@@ -4623,25 +4757,44 @@ class AsyncScyllaDBStore(BaseStore):
         """
         Gracefully shutdown the store and cleanup resources.
 
-        This method:
-        - Stops TTL sweeper task
-        - Closes Qdrant client connection
-        - Clears prepared statement cache
-        - Clears embedding cache
-        - Does NOT close the ScyllaDB session (caller's responsibility)
+        When to call:
+            - RECOMMENDED: On application shutdown for clean resource cleanup
+            - OPTIONAL: For long-lived applications (web servers, LangGraph apps)
+            - AUTOMATIC: When using `async with` context manager
 
-        Example:
+        What it does:
+            - Stops TTL sweeper task
+            - Closes Qdrant client connection
+            - Clears prepared statement cache
+            - Clears embedding cache (resets cache statistics)
+            - Shuts down Cassandra cluster (if created via create() method)
+            - Does NOT close session (if passed externally)
+
+        Impact of NOT calling:
+            - Embedding cache persists (cache stats remain)
+            - Resources cleaned up on process exit
+            - May see warnings on shutdown
+
+        Example (context manager - automatic):
             async with AsyncScyllaDBStore.from_contact_points(...) as store:
-                # ... use store
-                pass  # aclose() called automatically
+                await store.aput(...)
+                # aclose() called automatically on exit
 
-            # Or manually:
-            store = AsyncScyllaDBStore(...)
+        Example (create() method - optional):
+            store = await AsyncScyllaDBStore.create(...)
+            await store.setup()
+            await store.aput(...)
+            # Optional cleanup
+            await store.aclose()  # Recommended but not required
+
+        Example (manual construction):
+            store = AsyncScyllaDBStore(session=session, ...)
             try:
                 await store.setup()
-                # ... use store
+                await store.aput(...)
             finally:
-                await store.aclose()
+                await store.aclose()  # Session is caller's responsibility
+                session.shutdown()
         """
         logger.info(f"Shutting down AsyncScyllaDBStore for keyspace '{self.keyspace}'...")
 
@@ -4680,6 +4833,17 @@ class AsyncScyllaDBStore(BaseStore):
         if self.tracer:
             logger.info("Exporting final traces...")
             # OpenTelemetry auto-exports on shutdown
+
+        # Shutdown cluster if created via create() method
+        if hasattr(self, '_cluster') and self._cluster:
+            logger.info("Shutting down Cassandra cluster...")
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    None, self._cluster.shutdown
+                )
+                logger.info("Cassandra cluster shutdown successfully")
+            except Exception as e:
+                logger.warning(f"Error shutting down cluster: {e}")
 
         logger.info(f"AsyncScyllaDBStore shutdown complete for keyspace '{self.keyspace}'")
 
