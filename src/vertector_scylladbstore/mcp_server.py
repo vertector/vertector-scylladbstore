@@ -22,6 +22,7 @@ from mcp.types import (
 
 from vertector_scylladbstore.store import AsyncScyllaDBStore
 from vertector_scylladbstore.config import load_config_from_env, load_index_config_from_env
+from vertector_scylladbstore.embeddings import QwenEmbeddings
 
 # Configure logging to stderr so it doesn't interfere with stdio communication
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
@@ -49,11 +50,21 @@ async def _get_store() -> AsyncIterator[AsyncScyllaDBStore]:
              keyspace = os.getenv("SCYLLADB_KEYSPACE", "vertector_store")
              qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
              
+             # Initialize Qwen embeddings for semantic search
              index_config = None
              try:
-                 index_config = load_index_config_from_env()
-             except Exception:
-                 logger.warning("Could not load index config from env. Semantic search may be limited.")
+                 base_config = load_index_config_from_env()
+                 if base_config:
+                     # Use Qwen embeddings (free, open-source)
+                     embeddings = QwenEmbeddings()
+                     index_config = {
+                         "dims": embeddings.dims,
+                         "embed": embeddings,
+                         "fields": base_config.get("fields", ["$"]),
+                     }
+                     logger.info(f"Initialized Qwen embeddings with {embeddings.dims} dimensions")
+             except Exception as e:
+                 logger.warning(f"Could not initialize embeddings: {e}. Semantic search disabled.")
 
              _store = await AsyncScyllaDBStore.create(
                  contact_points=contact_points,

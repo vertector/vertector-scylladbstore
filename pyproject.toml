@@ -55,6 +55,7 @@ dependencies = [
     "prometheus-client>=0.18.0",
     "langgraph>=0.6.8",
     "langchain-core>=0.3.78",
+    "sentence-transformers>=5.1.2",
 ]
 
 [project.urls]
@@ -72,7 +73,6 @@ dev = [
     "black>=24.0.0",
     "ruff>=0.3.0",
     "mypy>=1.8.0",
-    "langchain-google-genai>=1.0.0",
     "mcp>=1.0.0",
 ]
 

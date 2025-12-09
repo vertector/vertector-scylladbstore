@@ -13,8 +13,9 @@ import pytest
 import pytest_asyncio
 from typing import AsyncIterator
 from cassandra.cluster import Cluster
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from dotenv import load_dotenv
+
+from vertector_scylladbstore.embeddings import QwenEmbeddings
 
 # Load environment variables for tests
 load_dotenv()
@@ -88,10 +89,15 @@ def mock_embeddings():
     return MockEmbeddings(dims=768)
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def real_embeddings():
-    """Provide real embeddings for integration tests."""
-    return GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+    """
+    Provide real embeddings for integration tests.
+
+    Uses Qwen3 open-source model (no API key required).
+    Session-scoped to avoid reloading the model for each test.
+    """
+    return QwenEmbeddings()
 
 
 # ============================================================================
@@ -195,14 +201,14 @@ async def store_with_real_embeddings(scylla_session, real_embeddings):
     """
     Provide store with real embeddings (for integration tests).
 
-    Uses Google embeddings - requires API key.
+    Uses Qwen3 open-source embeddings (no API key required).
     """
     from vertector_scylladbstore import AsyncScyllaDBStore
 
     keyspace = "test_store_integration"
 
     index_config = {
-        "dims": 768,
+        "dims": real_embeddings.dims,  # Qwen3-Embedding-0.6B outputs 1024 dims
         "embed": real_embeddings,
         "fields": ["$"]
     }

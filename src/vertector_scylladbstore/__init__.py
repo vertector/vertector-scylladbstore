@@ -63,6 +63,10 @@ from vertector_scylladbstore.logging_utils import (
     log_with_context,
 )
 
+from vertector_scylladbstore.embeddings import (
+    QwenEmbeddings,
+)
+
 __version__ = "1.0.0"
 
 __all__ = [
@@ -114,4 +118,6 @@ __all__ = [
     "PerformanceLogger",
     "setup_production_logging",
     "log_with_context",
+    # Embeddings
+    "QwenEmbeddings",
 ]
