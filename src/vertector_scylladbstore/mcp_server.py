@@ -186,20 +186,20 @@ async def list_tools() -> List[Tool]:
                 "required": ["key", "value", "namespace"]
             }
         ),
-         Tool(
+        Tool(
             name="update_memory",
-            description="Update an existing memory/document store.",
+            description="Partially update an existing memory/document by merging new fields into the existing value. Only specified fields are updated; existing fields not in the update are preserved.",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "key": {"type": "string"},
-                    "value": {"type": "object"},
+                    "key": {"type": "string", "description": "Key of the item to update"},
+                    "value": {"type": "object", "description": "Fields to merge into existing value"},
                     "namespace": {
                         "type": "tuple",
                         "items": {"type": "string"},
                         "description": "Namespace tuple (e.g., ('users', '123'))"
                     },
-                    "ttl": {"type": "number"}
+                    "ttl": {"type": "number", "description": "Optional new TTL in seconds"}
                 },
                 "required": ["key", "value", "namespace"]
             }
@@ -304,16 +304,15 @@ async def call_tool(name: str, arguments: dict) -> List[TextContent]:
                     })
                 return [TextContent(type="text", text=json.dumps(formatted, indent=2))]
 
-            elif name == "save_memory" or name == "update_memory":
-                # Both use aput
+            elif name == "save_memory":
                 key = arguments["key"]
                 value = arguments["value"]
                 namespace = arguments["namespace"]
                 ttl = arguments.get("ttl")
                 wait_sync = arguments.get("wait_sync", True)
-                
+
                 ns_tuple = _ensure_tuple(namespace)
-                
+
                 await store.aput(
                     namespace=ns_tuple,
                     key=key,
@@ -322,6 +321,31 @@ async def call_tool(name: str, arguments: dict) -> List[TextContent]:
                     wait_for_vector_sync=wait_sync
                 )
                 return [TextContent(type="text", text=f"Successfully saved item at {namespace}/{key}")]
+
+            elif name == "update_memory":
+                key = arguments["key"]
+                updates = arguments["value"]
+                namespace = arguments["namespace"]
+                ttl = arguments.get("ttl")
+
+                ns_tuple = _ensure_tuple(namespace)
+
+                # Fetch existing item
+                existing = await store.aget(namespace=ns_tuple, key=key)
+                if not existing:
+                    return [TextContent(type="text", text=f"Item not found at {namespace}/{key}. Use save_memory to create new items.")]
+
+                # Merge updates into existing value
+                merged_value = {**existing.value, **updates}
+
+                await store.aput(
+                    namespace=ns_tuple,
+                    key=key,
+                    value=merged_value,
+                    ttl=ttl,
+                    wait_for_vector_sync=True
+                )
+                return [TextContent(type="text", text=f"Successfully updated item at {namespace}/{key}")]
 
             elif name == "read_memory":
                 key = arguments["key"]
