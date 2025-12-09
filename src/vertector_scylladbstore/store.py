@@ -914,7 +914,9 @@ class AsyncScyllaDBStore(BaseStore):
             session: ScyllaDB/Cassandra session
             keyspace: Keyspace name
             deserializer: Optional JSON deserializer
-            index: Semantic search configuration (REQUIRED - IndexConfig with dims and embed)
+            index: Semantic search configuration. Pass {} for defaults (Qwen embeddings).
+                   If embed is not specified, defaults to QwenEmbeddings (open-source).
+                   If dims is not specified, auto-detects from embeddings model.
             sai_index: Optional SAI secondary index configuration
             ttl: Optional TTL configuration
             execution_profiles: Optional execution profile configurations
@@ -935,7 +937,8 @@ class AsyncScyllaDBStore(BaseStore):
         self.session = session
         self.keyspace = keyspace
         self.deserializer = deserializer or json.loads
-        self.index_config = self._process_index_config(index) if index else None
+        # Process index config - empty dict {} enables semantic search with Qwen defaults
+        self.index_config = self._process_index_config(index) if index is not None else None
         self.sai_config = sai_index or {}
         self.ttl_config = ttl or {}
         self.execution_profiles = execution_profiles or {}
@@ -1019,6 +1022,9 @@ class AsyncScyllaDBStore(BaseStore):
         """
         Validate and process IndexConfig.
 
+        If 'embed' is not provided, defaults to QwenEmbeddings (open-source, no API key).
+        If 'dims' is not provided, it will be auto-detected from the embeddings model.
+
         Args:
             config: Raw IndexConfig from user
 
@@ -1028,11 +1034,22 @@ class AsyncScyllaDBStore(BaseStore):
         Raises:
             ValueError: If config is invalid
         """
-        if "dims" not in config:
-            raise ValueError("IndexConfig must include 'dims' field")
+        # Default to QwenEmbeddings if embed not provided
+        if "embed" not in config or config["embed"] is None:
+            from vertector_scylladbstore.embeddings import QwenEmbeddings
+            config["embed"] = QwenEmbeddings()
+            logger.info("Using default QwenEmbeddings (Qwen/Qwen3-Embedding-0.6B)")
 
-        if "embed" not in config:
-            raise ValueError("IndexConfig must include 'embed' field")
+        # Auto-detect dims from embeddings if not provided
+        if "dims" not in config:
+            embed = config["embed"]
+            if hasattr(embed, "dims"):
+                config["dims"] = embed.dims
+                logger.info(f"Auto-detected embedding dimensions: {config['dims']}")
+            else:
+                raise ValueError(
+                    "IndexConfig must include 'dims' field, or embed must have a 'dims' attribute"
+                )
 
         # Set default fields if not provided
         if "fields" not in config:
