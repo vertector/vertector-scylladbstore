@@ -41,9 +41,11 @@ uv run mypy src/
 
 ## Architecture
 
-The package consists of five core modules in `src/vertector_scylladbstore/`:
+The package consists of six core modules in `src/vertector_scylladbstore/`:
 
 - **store.py**: Core `AsyncScyllaDBStore` class implementing LangGraph's `BaseStore` interface. Contains CRUD operations (`aput`, `aget`, `adelete`, `asearch`), batch processing (`abatch`), and TTL management. Includes embedded `CircuitBreaker` and `LRUCache` classes.
+
+- **embeddings.py**: `QwenEmbeddings` class using Qwen3-Embedding-0.6B (1024 dimensions). This is the default embedding model - no API key required.
 
 - **config.py**: Pydantic v2 configuration models (`ScyllaDBStoreConfig`, `AuthConfig`, `TLSConfig`, `RetryConfig`, etc.). Supports loading from environment variables via `load_config_from_env()` and secrets resolution via `SecretsManager`.
 
@@ -64,7 +66,8 @@ Two primary patterns for creating stores:
 async with AsyncScyllaDBStore.from_contact_points(
     contact_points=["localhost"],
     keyspace="my_app",
-    qdrant_url="http://localhost:6333"
+    qdrant_url="http://localhost:6333",
+    index={}  # Enable semantic search with Qwen defaults
 ) as store:
     await store.aput(...)
 
@@ -72,11 +75,28 @@ async with AsyncScyllaDBStore.from_contact_points(
 store = await AsyncScyllaDBStore.create(
     contact_points=["localhost"],
     keyspace="my_app",
-    qdrant_url="http://localhost:6333"
+    qdrant_url="http://localhost:6333",
+    index={}  # Enable semantic search with Qwen defaults
 )
 await store.setup()
 # ... use store ...
 await store.aclose()  # Optional cleanup
+```
+
+### Embeddings
+
+By default, `index={}` uses `QwenEmbeddings` (Qwen3-Embedding-0.6B, 1024 dimensions). No API key required.
+
+```python
+# Default Qwen embeddings
+index={}
+
+# Specify only fields to embed
+index={"fields": ["title", "content"]}
+
+# Custom embeddings
+from langchain_openai import OpenAIEmbeddings
+index={"dims": 1536, "embed": OpenAIEmbeddings()}
 ```
 
 ### Namespace Convention
@@ -89,7 +109,7 @@ Tests require ScyllaDB and Qdrant running locally (via docker-compose). Test fix
 - `scylla_session`: Raw Cassandra session
 - `store_no_embeddings`: Basic store for CRUD tests
 - `store_with_mock_embeddings`: Store with deterministic mock embeddings for unit tests
-- `store_with_real_embeddings`: Store with Google embeddings for integration tests
+- `store_with_real_embeddings`: Store with Qwen embeddings for integration tests (no API key needed)
 
 ## Environment Variables
 

@@ -13,6 +13,7 @@ Production-ready ScyllaDB + Qdrant store with vector search capabilities. Built 
 ### Core Functionality
 - ✅ **Hybrid Storage** - ScyllaDB for documents, Qdrant for vector search
 - ✅ **Semantic Search** - Vector embeddings and similarity search via Qdrant
+- ✅ **Built-in Embeddings** - Qwen3 open-source model (no API key required)
 - ✅ **TTL Support** - Automatic expiration with refresh-on-read
 - ✅ **Batch Operations** - High-performance bulk operations
 - ✅ **Hierarchical Namespaces** - Organize data with tuple-based namespaces
@@ -152,20 +153,15 @@ cluster.shutdown()
 
 ### With Embeddings (Semantic Search)
 
+Semantic search is enabled by passing `index={}`. By default, it uses **Qwen3-Embedding-0.6B** (open-source, no API key required).
+
 ```python
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-
-embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
-
+# Simplest setup - uses Qwen embeddings by default (1024 dimensions)
 async with AsyncScyllaDBStore.from_contact_points(
     contact_points=["localhost"],
     keyspace="my_app",
     qdrant_url="http://localhost:6333",
-    index={
-        "dims": 768,
-        "embed": embeddings,
-        "fields": ["$"]
-    }
+    index={}  # Enable semantic search with Qwen defaults
 ) as store:
     # Store with automatic embedding
     await store.aput(
@@ -176,11 +172,33 @@ async with AsyncScyllaDBStore.from_contact_points(
 
     # Semantic search
     results = await store.asearch(
-        namespace_prefix=("docs",),
+        ("docs",),
         query="What are vector databases?",
         limit=5
     )
-    )
+```
+
+#### Custom Embeddings (Optional)
+
+You can also use your own embeddings model:
+
+```python
+from vertector_scylladbstore import QwenEmbeddings
+
+# Or use a different model
+from langchain_openai import OpenAIEmbeddings
+
+async with AsyncScyllaDBStore.from_contact_points(
+    contact_points=["localhost"],
+    keyspace="my_app",
+    qdrant_url="http://localhost:6333",
+    index={
+        "dims": 1536,
+        "embed": OpenAIEmbeddings(),
+        "fields": ["content"]  # Only embed specific fields
+    }
+) as store:
+    # ...
 ```
 
 ### Model Context Protocol (MCP) Server
@@ -275,6 +293,9 @@ vertector_scylladbstore/
 │   ├── CircuitBreaker       # Resilience pattern
 │   ├── LRUCache            # Embedding cache
 │   └── QueryMetrics        # Performance tracking
+│
+├── embeddings.py         # Embedding models
+│   └── QwenEmbeddings      # Default: Qwen3-Embedding-0.6B (1024 dims)
 │
 ├── config.py             # Pydantic configuration models
 │   ├── ScyllaDBStoreConfig # Main config
