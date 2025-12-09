@@ -606,3 +606,34 @@ def load_config_from_env() -> ScyllaDBStoreConfig:
     config.resolve_secrets()
 
     return config
+
+def load_index_config_from_env() -> dict[str, Any] | None:
+    """
+    Load index configuration for semantic search from environment variables.
+    
+    Reads:
+    - INDEX_DIMS (int): Dimensions for embeddings (e.g., 1536, 768)
+    - INDEX_FIELDS (str): Comma-separated list of field names or "$" for all (default: "$")
+    
+    Returns:
+        IndexConfig dict or None if INDEX_DIMS is not set.
+    """
+    dims_str = os.getenv("INDEX_DIMS")
+    if not dims_str:
+        return None
+        
+    try:
+        dims = int(dims_str)
+    except ValueError:
+        logger.warning(f"Invalid INDEX_DIMS value: {dims_str}. Semantic search disabled.")
+        return None
+        
+    fields_str = os.getenv("INDEX_FIELDS", "$")
+    fields = [f.strip() for f in fields_str.split(",")]
+    
+    return {
+        "dims": dims,
+        "fields": fields,
+        # Note: 'embed' is missing and must be injected or mocked if not provided programmatically
+        "embed": None 
+    }

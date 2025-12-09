@@ -24,6 +24,7 @@ Production-ready ScyllaDB + Qdrant store with vector search capabilities. Built 
 - 🛡️ **Resilience** - Circuit breaker, exponential backoff, configurable retries
 - ⚡ **Performance** - LRU caching, batch embeddings, parallel processing (66-70 docs/sec)
 - 🚦 **Rate Limiting** - Token bucket and sliding window algorithms
+- 🤖 **MCP Server** - Built-in Model Context Protocol server for AI agent integration
 - ✅ **Testing** - Comprehensive test suite (173/173 tests passing)
 
 ## Quick Start
@@ -179,6 +180,42 @@ async with AsyncScyllaDBStore.from_contact_points(
         query="What are vector databases?",
         limit=5
     )
+    )
+```
+
+### Model Context Protocol (MCP) Server
+
+Expose your store directly to AI agents (like Claude) using the built-in MCP server.
+
+**Run the server:**
+```bash
+# Configure standard environment variables first
+export SCYLLADB_CONTACT_POINTS=localhost
+export SCYLLADB_KEYSPACE=my_app
+
+# Run the server
+python -m vertector_scylladbstore
+```
+
+**Features available to agents:**
+*   **Resources**: Read documents (`store://ns/key`) and metrics (`store://metrics`).
+*   **Tools**: `search_store`, `save_memory`, `read_memory`, `delete_memory`, `list_namespaces`.
+    > **Note**: Tools utilize **stringified tuples** for namespaces (e.g., `('users', '123')`). Lists are strictly rejected.
+
+**Claude Desktop Config (`claude_config.json`):**
+```json
+{
+  "mcpServers": {
+    "vertector-store": {
+      "command": "python",
+      "args": ["-m", "vertector_scylladbstore"],
+      "env": {
+        "SCYLLADB_CONTACT_POINTS": "localhost",
+        "SCYLLADB_KEYSPACE": "my_app"
+      }
+    }
+  }
+}
 ```
 
 ### Local Development Setup
